@@ -1,56 +1,21 @@
 import React, { useEffect, useState } from 'react';
 import MetricCard from './components/MetricCard';
 import PageHeader from './components/PageHeader';
-import { shopify } from './services/api';
+import { shopify, ga4 } from './services/api';
 
 const departments = [
-  {
-    name: 'Business Intelligence',
-    description: 'Analytics, KPIs, and data insights',
-    path: '/bi',
-    icon: '📊',
-    color: 'bg-blue-50 border-blue-200',
-  },
-  {
-    name: 'Sales',
-    description: 'Pipeline, orders, and revenue tracking',
-    path: '/sales',
-    icon: '💰',
-    color: 'bg-green-50 border-green-200',
-  },
-  {
-    name: 'Marketing',
-    description: 'GA4 analytics, campaigns, and SEO',
-    path: '/marketing',
-    icon: '📣',
-    color: 'bg-yellow-50 border-yellow-200',
-  },
-  {
-    name: 'IT',
-    description: 'Infrastructure and integrations',
-    path: '/it',
-    icon: '🖥️',
-    color: 'bg-purple-50 border-purple-200',
-  },
-  {
-    name: 'Finance',
-    description: 'Xero invoicing and financial reports',
-    path: '/finance',
-    icon: '🧾',
-    color: 'bg-red-50 border-red-200',
-  },
-  {
-    name: 'Content',
-    description: 'Publishing schedule and asset management',
-    path: '/content',
-    icon: '📝',
-    color: 'bg-indigo-50 border-indigo-200',
-  },
+  { name: 'Business Intelligence', description: 'Analytics, KPIs, and data insights', path: '/bi', icon: '📊', color: 'bg-blue-50 border-blue-200' },
+  { name: 'Sales', description: 'Pipeline, orders, and revenue tracking', path: '/sales', icon: '💰', color: 'bg-green-50 border-green-200' },
+  { name: 'Marketing', description: 'GA4 analytics, campaigns, and SEO', path: '/marketing', icon: '📣', color: 'bg-yellow-50 border-yellow-200' },
+  { name: 'IT', description: 'Infrastructure and integrations', path: '/it', icon: '🖥️', color: 'bg-purple-50 border-purple-200' },
+  { name: 'Finance', description: 'Xero invoicing and financial reports', path: '/finance', icon: '🧾', color: 'bg-red-50 border-red-200' },
+  { name: 'Content', description: 'Publishing schedule and asset management', path: '/content', icon: '📝', color: 'bg-indigo-50 border-indigo-200' },
 ];
 
 const Dashboard: React.FC = () => {
   const [todayOrders, setTodayOrders] = useState<number | null>(null);
   const [revenue30d, setRevenue30d] = useState<number | null>(null);
+  const [sessions7d, setSessions7d] = useState<number | null>(null);
 
   useEffect(() => {
     const since30d = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
@@ -63,37 +28,32 @@ const Dashboard: React.FC = () => {
     }).catch(err => {
       console.error('[dashboard] Shopify fetch failed:', err);
     });
+
+    ga4.overview('7daysAgo', 'today').then((data: { totalSessions?: number }) => {
+      if (data.totalSessions !== undefined) setSessions7d(data.totalSessions);
+    }).catch(err => {
+      console.error('[dashboard] GA4 fetch failed:', err);
+    });
   }, []);
 
   const fmtRevenue = (amount: number | null) =>
-    amount === null
-      ? '…'
-      : `$${amount.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+    amount === null ? '…' : `$${amount.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
 
   return (
     <div className="p-8">
-      <PageHeader
-        title="GCI Command Center"
-        description="Unified operations dashboard for GCI Tires"
-      />
+      <PageHeader title="GCI Command Center" description="Unified operations dashboard for GCI Tires" />
 
-      {/* Quick metrics */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
         <MetricCard title="Today's Orders" value={todayOrders ?? '…'} subtitle="Shopify" icon="🛒" />
         <MetricCard title="Revenue (30d)" value={fmtRevenue(revenue30d)} subtitle="Shopify" icon="💵" />
-        <MetricCard title="Website Sessions" value="—" subtitle="GA4 · last 7 days" icon="👀" />
+        <MetricCard title="Website Sessions" value={sessions7d !== null ? sessions7d.toLocaleString('en-US') : '…'} subtitle="GA4 · last 7 days" icon="👀" />
         <MetricCard title="Outstanding Invoices" value="—" subtitle="Xero" icon="📋" />
       </div>
 
-      {/* Department grid */}
       <h2 className="text-lg font-semibold text-gray-700 mb-4">Departments</h2>
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
         {departments.map(dept => (
-          <a
-            key={dept.path}
-            href={dept.path}
-            className={`block rounded-xl border p-5 hover:shadow-md transition-shadow ${dept.color}`}
-          >
+          <a key={dept.path} href={dept.path} className={`block rounded-xl border p-5 hover:shadow-md transition-shadow ${dept.color}`}>
             <div className="flex items-center gap-3 mb-2">
               <span className="text-2xl">{dept.icon}</span>
               <h3 className="font-semibold text-gray-800">{dept.name}</h3>
