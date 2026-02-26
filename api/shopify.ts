@@ -63,11 +63,38 @@ export async function getProducts(limit = 50): Promise<ShopifyProduct[]> {
   return data.products;
 }
 
+export async function getTodayOrderCount(): Promise<number> {
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+  const res = await fetch(
+    `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/orders/count.json?status=any&created_at_min=${todayStart.toISOString()}`,
+    {
+      headers: {
+        'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN!,
+        'Content-Type': 'application/json',
+      },
+    }
+  );
+  if (!res.ok) throw new Error(`Shopify order count fetch failed: ${res.status}`);
+  const data = await res.json();
+  return data.count as number;
+}
+
 export async function getRevenueMetrics(since: string): Promise<{ total: number; count: number }> {
-  const orders = await getOrders(250, 'paid');
-  const filtered = orders.filter(o => new Date(o.created_at) >= new Date(since));
-  const total = filtered.reduce((sum, o) => sum + parseFloat(o.total_price), 0);
-  return { total, count: filtered.length };
+  const res = await fetch(
+    `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/orders.json?limit=250&status=any&financial_status=paid&created_at_min=${since}`,
+    {
+      headers: {
+        'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN!,
+        'Content-Type': 'application/json',
+      },
+    }
+  );
+  if (!res.ok) throw new Error(`Shopify revenue fetch failed: ${res.status}`);
+  const data = await res.json();
+  const orders: ShopifyOrder[] = data.orders;
+  const total = orders.reduce((sum, o) => sum + parseFloat(o.total_price), 0);
+  return { total, count: orders.length };
 }
 
 // Vercel serverless handler
@@ -80,6 +107,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const { resource, limit, status, since } = req.query;
 
     switch (resource) {
+      case 'today-orders': {
+        const count = await getTodayOrderCount();
+        return res.status(200).json({ count });
+      }
       case 'orders': {
         const orders = await getOrders(
           limit ? parseInt(limit as string) : 50,
@@ -98,7 +129,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         return res.status(200).json(metrics);
       }
       default:
-        return res.status(400).json({ error: 'Unknown resource. Use: orders | products | revenue' });
+        return res.status(400).json({ error: 'Unknown resource. Use: today-orders | orders | products | revenue' });
     }
   } catch (err) {
     console.error('[shopify api]', err);

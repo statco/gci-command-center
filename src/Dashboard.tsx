@@ -1,6 +1,7 @@
-import React from 'react';
+import React, { useEffect, useState } from 'react';
 import MetricCard from './components/MetricCard';
 import PageHeader from './components/PageHeader';
+import { shopify } from './services/api';
 
 const departments = [
   {
@@ -48,6 +49,27 @@ const departments = [
 ];
 
 const Dashboard: React.FC = () => {
+  const [todayOrders, setTodayOrders] = useState<number | null>(null);
+  const [revenue30d, setRevenue30d] = useState<number | null>(null);
+
+  useEffect(() => {
+    const since30d = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    Promise.all([
+      shopify.todayOrders(),
+      shopify.revenue(since30d),
+    ]).then(([todayData, revenueData]) => {
+      setTodayOrders(todayData.count);
+      setRevenue30d(revenueData.total);
+    }).catch(err => {
+      console.error('[dashboard] Shopify fetch failed:', err);
+    });
+  }, []);
+
+  const fmtRevenue = (amount: number | null) =>
+    amount === null
+      ? '…'
+      : `$${amount.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+
   return (
     <div className="p-8">
       <PageHeader
@@ -57,8 +79,8 @@ const Dashboard: React.FC = () => {
 
       {/* Quick metrics */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-        <MetricCard title="Today's Orders" value="—" subtitle="Shopify" icon="🛒" />
-        <MetricCard title="Revenue (30d)" value="—" subtitle="Shopify" icon="💵" />
+        <MetricCard title="Today's Orders" value={todayOrders ?? '…'} subtitle="Shopify" icon="🛒" />
+        <MetricCard title="Revenue (30d)" value={fmtRevenue(revenue30d)} subtitle="Shopify" icon="💵" />
         <MetricCard title="Website Sessions" value="—" subtitle="GA4 · last 7 days" icon="👀" />
         <MetricCard title="Outstanding Invoices" value="—" subtitle="Xero" icon="📋" />
       </div>

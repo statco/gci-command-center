@@ -15,12 +15,14 @@ async function apiFetch<T>(path: string, params?: Record<string, string>): Promi
 
 // Shopify
 export const shopify = {
+  todayOrders: () =>
+    apiFetch<{ count: number }>('/api/shopify', { resource: 'today-orders' }),
   orders: (params?: { limit?: string; status?: string }) =>
     apiFetch('/api/shopify', { resource: 'orders', ...params }),
   products: (params?: { limit?: string }) =>
     apiFetch('/api/shopify', { resource: 'products', ...params }),
   revenue: (since?: string) =>
-    apiFetch('/api/shopify', { resource: 'revenue', ...(since ? { since } : {}) }),
+    apiFetch<{ total: number; count: number }>('/api/shopify', { resource: 'revenue', ...(since ? { since } : {}) }),
 };
 
 // Xero
