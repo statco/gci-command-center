@@ -1,31 +1,47 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { BetaAnalyticsDataClient } from '@google-analytics/data';
 
 const GA4_PROPERTY_ID = process.env.GA4_PROPERTY_ID;
-const GA4_SERVICE_ACCOUNT_KEY = process.env.GA4_SERVICE_ACCOUNT_KEY;
+const GA4_API_KEY = process.env.GA4_API_KEY;
 
-function makeClient(): BetaAnalyticsDataClient {
-  if (!GA4_SERVICE_ACCOUNT_KEY) throw new Error('GA4_SERVICE_ACCOUNT_KEY not set');
-  if (!GA4_PROPERTY_ID) throw new Error('GA4_PROPERTY_ID not set');
-  const credentials = JSON.parse(GA4_SERVICE_ACCOUNT_KEY);
-  return new BetaAnalyticsDataClient({ credentials });
+interface GA4ReportRow {
+  dimensionValues?: Array<{ value?: string }>;
+  metricValues?: Array<{ value?: string }>;
+}
+
+interface GA4ReportResponse {
+  rows?: GA4ReportRow[];
+  rowCount?: number;
 }
 
 async function runReport(
-  client: BetaAnalyticsDataClient,
   dimensions: string[],
   metrics: string[],
   startDate: string,
   endDate: string
 ): Promise<{ dimensions: string[]; metrics: string[]; rows: Array<Record<string, string>>; rowCount: number }> {
-  const [response] = await client.runReport({
-    property: `properties/${GA4_PROPERTY_ID}`,
-    dimensions: dimensions.map(name => ({ name })),
-    metrics: metrics.map(name => ({ name })),
-    dateRanges: [{ startDate, endDate }],
+  if (!GA4_PROPERTY_ID) throw new Error('GA4_PROPERTY_ID not set');
+  if (!GA4_API_KEY) throw new Error('GA4_API_KEY not set');
+
+  const url = `https://analyticsdata.googleapis.com/v1beta/properties/${GA4_PROPERTY_ID}:runReport?key=${GA4_API_KEY}`;
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      dimensions: dimensions.map(name => ({ name })),
+      metrics: metrics.map(name => ({ name })),
+      dateRanges: [{ startDate, endDate }],
+    }),
   });
 
-  const rows = (response.rows || []).map(row => {
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(`GA4 runReport failed ${res.status}: ${JSON.stringify(err)}`);
+  }
+
+  const data: GA4ReportResponse = await res.json();
+
+  const rows = (data.rows || []).map(row => {
     const record: Record<string, string> = {};
     dimensions.forEach((dim, i) => {
       record[dim] = row.dimensionValues?.[i]?.value ?? '';
@@ -36,10 +52,9 @@ async function runReport(
     return record;
   });
 
-  return { dimensions, metrics, rows, rowCount: response.rowCount ?? rows.length };
+  return { dimensions, metrics, rows, rowCount: data.rowCount ?? rows.length };
 }
 
-// Vercel serverless handler
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'GET') {
     return res.status(405).json({ error: 'Method not allowed' });
@@ -50,12 +65,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const end = (endDate as string) || 'today';
 
   try {
-    const client = makeClient();
-
     switch (report) {
       case 'overview': {
         const data = await runReport(
-          client,
           ['date'],
           ['sessions', 'activeUsers', 'newUsers', 'bounceRate', 'averageSessionDuration'],
           start,
@@ -69,7 +81,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
       case 'top-pages': {
         const data = await runReport(
-          client,
           ['pagePath', 'pageTitle'],
           ['screenPageViews', 'averageSessionDuration', 'bounceRate'],
           start,
@@ -79,7 +90,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
       case 'traffic-sources': {
         const data = await runReport(
-          client,
           ['sessionDefaultChannelGroup', 'sessionSource', 'sessionMedium'],
           ['sessions', 'activeUsers', 'conversions'],
           start,
@@ -89,7 +99,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
       case 'conversions': {
         const data = await runReport(
-          client,
           ['eventName', 'date'],
           ['eventCount', 'conversions', 'totalRevenue'],
           start,
