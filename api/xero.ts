@@ -5,6 +5,9 @@ const XERO_CLIENT_SECRET = process.env.XERO_CLIENT_SECRET;
 const XERO_TENANT_ID = process.env.XERO_TENANT_ID;
 const XERO_REFRESH_TOKEN = process.env.XERO_REFRESH_TOKEN;
 
+const REDIRECT_URI = 'https://ops.gcitires.com/api/xero?resource=callback';
+const XERO_SCOPES = 'accounting.transactions.read accounting.reports.read accounting.settings.read offline_access';
+
 interface XeroTokenResponse {
   access_token: string;
   token_type: string;
@@ -85,6 +88,63 @@ export async function getAccounts(): Promise<XeroAccount[]> {
   return data.Accounts;
 }
 
+function getAuthUrl(): string {
+  if (!XERO_CLIENT_ID) throw new Error('XERO_CLIENT_ID not set');
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: XERO_CLIENT_ID,
+    redirect_uri: REDIRECT_URI,
+    scope: XERO_SCOPES,
+  });
+  return `https://login.xero.com/identity/connect/authorize?${params.toString()}`;
+}
+
+async function exchangeCodeForTokens(code: string): Promise<{ refresh_token: string; tenant_id: string }> {
+  if (!XERO_CLIENT_ID) throw new Error('XERO_CLIENT_ID not set');
+  if (!XERO_CLIENT_SECRET) throw new Error('XERO_CLIENT_SECRET not set');
+
+  const credentials = Buffer.from(`${XERO_CLIENT_ID}:${XERO_CLIENT_SECRET}`).toString('base64');
+
+  const tokenRes = await fetch('https://identity.xero.com/connect/token', {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${credentials}`,
+      'Content-Type': 'application/x-www-form-urlencoded',
+    },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: REDIRECT_URI,
+    }),
+  });
+
+  if (!tokenRes.ok) {
+    const err = await tokenRes.json().catch(() => ({}));
+    throw new Error(`Token exchange failed ${tokenRes.status}: ${JSON.stringify(err)}`);
+  }
+
+  const tokens: XeroTokenResponse = await tokenRes.json();
+
+  const connectionsRes = await fetch('https://api.xero.com/connections', {
+    headers: {
+      Authorization: `Bearer ${tokens.access_token}`,
+      'Content-Type': 'application/json',
+    },
+  });
+
+  if (!connectionsRes.ok) {
+    throw new Error(`Xero connections fetch failed: ${connectionsRes.status}`);
+  }
+
+  const connections: Array<{ tenantId: string; tenantName: string }> = await connectionsRes.json();
+  if (!connections.length) throw new Error('No Xero tenants found for this authorisation');
+
+  return {
+    refresh_token: tokens.refresh_token,
+    tenant_id: connections[0].tenantId,
+  };
+}
+
 // Vercel serverless handler
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'GET') {
@@ -92,9 +152,22 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const { resource, status, fromDate, toDate } = req.query;
+    const { resource, status, fromDate, toDate, code } = req.query;
 
     switch (resource) {
+      case 'auth-url': {
+        const url = getAuthUrl();
+        return res.status(200).json({ url });
+      }
+      case 'callback': {
+        if (!code) return res.status(400).json({ error: 'Missing code parameter' });
+        const result = await exchangeCodeForTokens(code as string);
+        return res.status(200).json({
+          message: 'Copy these values into your Vercel environment variables',
+          XERO_REFRESH_TOKEN: result.refresh_token,
+          XERO_TENANT_ID: result.tenant_id,
+        });
+      }
       case 'invoices': {
         const invoices = await getInvoices(status as string | undefined);
         return res.status(200).json({ invoices });
@@ -115,7 +188,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
       default:
         return res.status(400).json({
-          error: 'Unknown resource. Use: invoices | balance-sheet | profit-loss | accounts',
+          error: 'Unknown resource. Use: auth-url | callback | invoices | balance-sheet | profit-loss | accounts',
         });
     }
   } catch (err) {
