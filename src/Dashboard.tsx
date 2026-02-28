@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import MetricCard from './components/MetricCard';
 import PageHeader from './components/PageHeader';
-import { shopify, ga4 } from './services/api';
+import { shopify, ga4, xero } from './services/api';
 
 const departments = [
   { name: 'Business Intelligence', description: 'Analytics, KPIs, and data insights', path: '/bi', icon: '📊', color: 'bg-blue-50 border-blue-200' },
@@ -16,6 +16,7 @@ const Dashboard: React.FC = () => {
   const [todayOrders, setTodayOrders] = useState<number | null>(null);
   const [revenue30d, setRevenue30d] = useState<number | null>(null);
   const [sessions7d, setSessions7d] = useState<number | null>(null);
+  const [outstandingInvoices, setOutstandingInvoices] = useState<number | null>(null);
 
   useEffect(() => {
     const since30d = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
@@ -34,6 +35,10 @@ const Dashboard: React.FC = () => {
     }).catch(err => {
       console.error('[dashboard] GA4 fetch failed:', err);
     });
+
+    xero.invoices('AUTHORISED').then((data: any) => {
+      setOutstandingInvoices(data.invoices?.length ?? 0);
+    }).catch(err => console.error('[dashboard] Xero fetch failed:', err));
   }, []);
 
   const fmtRevenue = (amount: number | null) =>
@@ -47,7 +52,7 @@ const Dashboard: React.FC = () => {
         <MetricCard title="Today's Orders" value={todayOrders ?? '…'} subtitle="Shopify" icon="🛒" />
         <MetricCard title="Revenue (30d)" value={fmtRevenue(revenue30d)} subtitle="Shopify" icon="💵" />
         <MetricCard title="Website Sessions" value={sessions7d !== null ? sessions7d.toLocaleString('en-US') : '…'} subtitle="GA4 · last 7 days" icon="👀" />
-        <MetricCard title="Outstanding Invoices" value="—" subtitle="Xero" icon="📋" />
+        <MetricCard title="Outstanding Invoices" value={outstandingInvoices !== null ? outstandingInvoices : '…'} subtitle="Xero" icon="📋" />
       </div>
 
       <h2 className="text-lg font-semibold text-gray-700 mb-4">Departments</h2>
