@@ -105,7 +105,6 @@ function walmartHeaders(token: string): Record<string, string> {
     'WM_MARKET': 'ca',
     'WM_SVC.NAME': 'Walmart Marketplace',
     'WM_QOS.CORRELATION_ID': crypto.randomUUID(),
-    'WM_CONSUMER.CHANNEL.TYPE': 'SELLER',
     'Content-Type': 'application/json',
     Accept: 'application/json',
   };
@@ -175,13 +174,15 @@ function classify(price: number): GroupId {
 async function fetchAllWalmartTires(): Promise<CatalogueItem[]> {
   const token = await getWalmartToken();
   const all: CatalogueItem[] = [];
-  let cursor = '';
+  const PAGE_SIZE = 200;
+  let offset = 0;
+  let totalItems = Infinity;
   let page = 0;
   const MAX_PAGES = 100; // safety
 
-  while (page < MAX_PAGES) {
-    const qs = cursor ? `?limit=200&nextCursor=${encodeURIComponent(cursor)}` : '?limit=200';
-    const res = await fetch(`${WALMART_BASE}/v3/ca/items${qs}`, {
+  while (page < MAX_PAGES && offset < totalItems) {
+    const qs = `?limit=${PAGE_SIZE}&offset=${offset}`;
+    const res = await fetch(`${WALMART_BASE}/v3/items${qs}`, {
       headers: walmartHeaders(token),
     });
     if (!res.ok) {
@@ -189,6 +190,10 @@ async function fetchAllWalmartTires(): Promise<CatalogueItem[]> {
     }
     const data: any = await res.json();
     const list: any[] = data?.ItemResponse ?? data?.items ?? [];
+
+    if (page === 0) {
+      totalItems = (data?.totalItems as number) ?? list.length;
+    }
 
     for (const it of list) {
       const sku = String(it.sku ?? it.mart_sku ?? '');
@@ -208,9 +213,9 @@ async function fetchAllWalmartTires(): Promise<CatalogueItem[]> {
       });
     }
 
+    if (list.length === 0) break;
     page++;
-    cursor = data?.nextCursor || data?.meta?.nextCursor || '';
-    if (!cursor || list.length === 0) break;
+    offset += PAGE_SIZE;
     await delay(300); // rate-limit between pages
   }
 
