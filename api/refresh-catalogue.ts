@@ -105,6 +105,7 @@ function walmartHeaders(token: string): Record<string, string> {
     'WM_MARKET': 'ca',
     'WM_SVC.NAME': 'Walmart Marketplace',
     'WM_QOS.CORRELATION_ID': crypto.randomUUID(),
+    'WM_CONSUMER.CHANNEL.TYPE': 'SELLER',
     'Content-Type': 'application/json',
     Accept: 'application/json',
   };
