@@ -2,5 +2,12 @@
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api/$1" },
     { "source": "/(.*)", "destination": "/index.html" }
+  ],
+  "functions": {
+    "api/discount-proxy.ts": { "maxDuration": 60 },
+    "api/refresh-catalogue.ts": { "maxDuration": 300 }
+  },
+  "crons": [
+    { "path": "/api/refresh-catalogue", "schedule": "0 10 * * *" }
   ]
 }
