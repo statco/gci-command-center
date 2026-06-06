@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 
 const SHOPIFY_STORE_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN;
-const SHOPIFY_ADMIN_TOKEN = process.env.SHOPIFY_ADMIN_TOKEN;
+const SHOPIFY_ADMIN_API_TOKEN = process.env.SHOPIFY_ADMIN_API_TOKEN;
 
 interface ShopifyOrder {
   id: number;
@@ -37,7 +37,7 @@ export async function getOrders(limit = 50, status = 'any'): Promise<ShopifyOrde
     `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/orders.json?limit=${limit}&status=${status}`,
     {
       headers: {
-        'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN!,
+        'X-Shopify-Access-Token': SHOPIFY_ADMIN_API_TOKEN!,
         'Content-Type': 'application/json',
       },
     }
@@ -52,7 +52,7 @@ export async function getProducts(limit = 50): Promise<ShopifyProduct[]> {
     `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/products.json?limit=${limit}`,
     {
       headers: {
-        'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN!,
+        'X-Shopify-Access-Token': SHOPIFY_ADMIN_API_TOKEN!,
         'Content-Type': 'application/json',
       },
     }
@@ -69,7 +69,7 @@ export async function getTodayOrderCount(): Promise<number> {
     `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/orders/count.json?status=any&created_at_min=${todayStart.toISOString()}`,
     {
       headers: {
-        'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN!,
+        'X-Shopify-Access-Token': SHOPIFY_ADMIN_API_TOKEN!,
         'Content-Type': 'application/json',
       },
     }
@@ -84,7 +84,7 @@ export async function getRevenueMetrics(since: string): Promise<{ total: number;
     `https://${SHOPIFY_STORE_DOMAIN}/admin/api/2024-01/orders.json?limit=250&status=any&financial_status=paid&created_at_min=${since}`,
     {
       headers: {
-        'X-Shopify-Access-Token': SHOPIFY_ADMIN_TOKEN!,
+        'X-Shopify-Access-Token': SHOPIFY_ADMIN_API_TOKEN!,
         'Content-Type': 'application/json',
       },
     }
