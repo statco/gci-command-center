@@ -7,6 +7,7 @@ import Marketing from './departments/Marketing';
 import IT from './departments/IT';
 import Finance from './departments/Finance';
 import Content from './departments/Content';
+import DiscountManager from './pages/DiscountManager';
 
 function App() {
   return (
@@ -18,6 +19,7 @@ function App() {
             <Route path="/" element={<Dashboard />} />
             <Route path="/bi" element={<BusinessIntelligence />} />
             <Route path="/sales" element={<Sales />} />
+            <Route path="/promotions" element={<DiscountManager />} />
             <Route path="/marketing" element={<Marketing />} />
             <Route path="/it" element={<IT />} />
             <Route path="/finance" element={<Finance />} />
