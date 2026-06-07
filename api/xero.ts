@@ -37,7 +37,18 @@ interface XeroAccount {
   Balance?: number;
 }
 
+class TokenExpiredError extends Error {
+  constructor(service: string, reauth: string) {
+    super(`${service} refresh token expired or revoked. Re-authenticate at: ${reauth}`);
+    this.name = 'TokenExpiredError';
+  }
+}
+
 async function getAccessToken(): Promise<string> {
+  if (!XERO_CLIENT_ID) throw new Error('XERO_CLIENT_ID not set');
+  if (!XERO_CLIENT_SECRET) throw new Error('XERO_CLIENT_SECRET not set');
+  if (!XERO_REFRESH_TOKEN) throw new TokenExpiredError('Xero', '/api/xero?resource=auth-url');
+
   const credentials = Buffer.from(`${XERO_CLIENT_ID}:${XERO_CLIENT_SECRET}`).toString('base64');
   const res = await fetch('https://identity.xero.com/connect/token', {
     method: 'POST',
@@ -47,10 +58,17 @@ async function getAccessToken(): Promise<string> {
     },
     body: new URLSearchParams({
       grant_type: 'refresh_token',
-      refresh_token: XERO_REFRESH_TOKEN!,
+      refresh_token: XERO_REFRESH_TOKEN,
     }),
   });
-  if (!res.ok) throw new Error(`Xero token refresh failed: ${res.status}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    // invalid_grant = token expired/revoked
+    if ((err as any)?.error === 'invalid_grant' || res.status === 400) {
+      throw new TokenExpiredError('Xero', '/api/xero?resource=auth-url');
+    }
+    throw new Error(`Xero token refresh failed ${res.status}: ${JSON.stringify(err)}`);
+  }
   const data: XeroTokenResponse = await res.json();
   return data.access_token;
 }
@@ -191,8 +209,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           error: 'Unknown resource. Use: auth-url | callback | invoices | balance-sheet | profit-loss | accounts',
         });
     }
-  } catch (err) {
+  } catch (err: any) {
     console.error('[xero api]', err);
-    return res.status(500).json({ error: 'Internal server error' });
+    if (err instanceof TokenExpiredError) {
+      return res.status(401).json({
+        error: 'XERO_REFRESH_TOKEN expired or revoked',
+        code: 'TOKEN_EXPIRED',
+        reauth: 'GET /api/xero?resource=auth-url',
+      });
+    }
+    return res.status(500).json({ error: err?.message || 'Internal server error' });
   }
 }
