@@ -98,8 +98,8 @@ async function getWalmartToken(): Promise<string> {
   return _token!;
 }
 
-function walmartHeaders(token: string): Record<string, string> {
-  return {
+function walmartHeaders(token: string, includeChannel = true): Record<string, string> {
+  const h: Record<string, string> = {
     'WM_SEC.ACCESS_TOKEN': token,
     'WM_GLOBAL_VERSION': '3.1',
     'WM_MARKET': 'ca',
@@ -108,6 +108,10 @@ function walmartHeaders(token: string): Record<string, string> {
     'Content-Type': 'application/json',
     Accept: 'application/json',
   };
+  // Walmart CANADA marketplace channel type — required on feed submissions.
+  // The /v3/items GET is proven to work without it, so callers can opt out.
+  if (includeChannel) h['WM_CONSUMER.CHANNEL.TYPE'] = 'SWAGGER_WALMART_CA_MARKETPLACE';
+  return h;
 }
 
 // ─── Vercel KV (REST, Upstash-compatible) ─────────────────────
@@ -183,7 +187,7 @@ async function fetchAllWalmartTires(): Promise<CatalogueItem[]> {
   while (page < MAX_PAGES && offset < totalItems) {
     const qs = `?limit=${PAGE_SIZE}&offset=${offset}`;
     const res = await fetch(`${WALMART_BASE}/v3/items${qs}`, {
-      headers: walmartHeaders(token),
+      headers: walmartHeaders(token, false), // items GET works without channel header
     });
     if (!res.ok) {
       throw new Error(`Walmart items HTTP ${res.status} on page ${page + 1}: ${(await res.text()).slice(0, 200)}`);

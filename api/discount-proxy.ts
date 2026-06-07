@@ -74,6 +74,9 @@ function walmartHeaders(token: string): Record<string, string> {
     'WM_MARKET': 'ca',
     'WM_SVC.NAME': 'Walmart Marketplace',
     'WM_QOS.CORRELATION_ID': crypto.randomUUID(),
+    // Walmart CANADA marketplace channel type. Required on feed submissions;
+    // a null/invalid value yields INVALID_REQUEST_HEADER.GMP_GATEWAY_API.
+    'WM_CONSUMER.CHANNEL.TYPE': 'SWAGGER_WALMART_CA_MARKETPLACE',
     'Content-Type': 'application/json',
     Accept: 'application/json',
   };

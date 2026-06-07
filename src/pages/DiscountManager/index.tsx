@@ -15,12 +15,25 @@ import {
   type GroupId,
   type ActiveSale,
 } from './useDiscountStore';
-import {
-  applyCompareAtDiscount,
-  revertCompareAt,
-  getVariantBySku,
-} from './shopify';
-import { submitPromotions, revertPromotions, buildPromoDates } from './walmart';
+import { buildPromoDates } from './walmart';
+
+// Server-side activation: Shopify variant lookup + compare_at writes happen in
+// api/activate-sale.ts (the browser cannot reach the Shopify Admin API directly).
+async function callActivateSale(
+  action: 'activate' | 'revert',
+  payload: Record<string, unknown>,
+): Promise<any> {
+  const res = await fetch(`/api/activate-sale?action=${action}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data?.success) {
+    throw new Error(data?.error || `activate-sale ${action} failed ${res.status}`);
+  }
+  return data;
+}
 
 // ─── Group presentation metadata ──────────────────────────────
 const GROUP_META: Record<
@@ -66,10 +79,6 @@ function relHoursAgo(iso: string): string {
   const h = Math.floor(diff / 3600_000);
   if (h < 1) return `${Math.max(1, Math.floor(diff / 60_000))} min ago`;
   return `${h} hour${h === 1 ? '' : 's'} ago`;
-}
-
-function discountedPrice(original: number, pct: number): number {
-  return parseFloat((original * (1 - pct / 100)).toFixed(2));
 }
 
 const DiscountManager: React.FC = () => {
@@ -164,38 +173,46 @@ const DiscountManager: React.FC = () => {
         }
       }
 
-      // Shopify: apply compare_at_price (best-effort, instant for the buyer).
-      let shopApplied = 0;
-      for (const item of items) {
-        try {
-          const variant = await getVariantBySku(item.sku);
-          if (variant) {
-            await applyCompareAtDiscount(variant.id, item.price, discountedPrice(item.price, pct));
-            shopApplied++;
-          }
-        } catch (e) {
-          console.error(`[DiscountManager] shopify apply failed for ${item.sku}:`, e);
-        }
-      }
-      addLog(`Shopify: compare_at applied to ${shopApplied}/${items.length} variants (Group ${meta.letter}).`, 'success');
-
-      // Walmart: submit the promotion feed via the proxy.
-      const feed = await submitPromotions(items, pct, group, state.promotionDuration);
-      const { effectiveDate, expirationDate } = buildPromoDates(state.promotionDuration);
-      const sale: ActiveSale = {
-        startedAt: new Date().toISOString(),
-        effectiveAt: effectiveDate,
-        expiresAt: expirationDate,
+      // Server-side: Shopify compare_at lookup/write, then Walmart feed.
+      const data = await callActivateSale('activate', {
+        group,
         pct,
-        feedId: feed.feedId ?? 'pending',
-        promotionType,
-      };
-      setState(prev => ({ activeSales: { ...prev.activeSales, [group]: sale } }));
+        durationDays: state.promotionDuration,
+        items: items.map(i => ({ sku: i.sku, price: i.price, group })),
+      });
+
+      const s = data.shopify || {};
       addLog(
-        `Group ${meta.letter} (${meta.label}) sale activated at ${pct}% — ${promotionType}. ` +
-        `Walmart feed ${sale.feedId} · live ~${fmtTime(effectiveDate)}.`,
-        'success',
+        `Shopify: compare_at applied to ${s.updated ?? 0}/${s.total ?? items.length} variants (Group ${meta.letter}).`,
+        (s.updated ?? 0) > 0 ? 'success' : 'warn',
       );
+      if (s.failed?.length) {
+        addLog(`Shopify: ${s.failed.length} variant(s) failed (e.g. ${s.failed[0]?.sku}: ${s.failed[0]?.error}).`, 'warn');
+      }
+
+      const w = data.walmart || {};
+      if (w.submitted) {
+        addLog(`Walmart: feed submitted successfully (feed ${w.feedId}) · live ~${fmtTime(w.effectiveDate)}.`, 'success');
+      } else {
+        addLog(`Walmart: feed not submitted${w.error ? ` — ${w.error}` : w.reason ? ` — ${w.reason}` : ''}.`, w.error ? 'error' : 'warn');
+      }
+
+      // Only mark the group live if Shopify actually updated ≥1 variant.
+      if ((s.updated ?? 0) > 0) {
+        const fallback = buildPromoDates(state.promotionDuration);
+        const sale: ActiveSale = {
+          startedAt: new Date().toISOString(),
+          effectiveAt: w.effectiveDate || fallback.effectiveDate,
+          expiresAt: w.expirationDate || fallback.expirationDate,
+          pct,
+          feedId: w.feedId ?? 'pending',
+          promotionType,
+        };
+        setState(prev => ({ activeSales: { ...prev.activeSales, [group]: sale } }));
+        addLog(`Group ${meta.letter} (${meta.label}) sale activated at ${pct}% — ${promotionType}.`, 'success');
+      } else {
+        addLog(`Group ${meta.letter} not activated — no Shopify variants matched.`, 'error');
+      }
     } catch (err: any) {
       console.error('[DiscountManager] activate failed:', err);
       addLog(`Activate Group ${meta.letter} failed: ${err?.message}`, 'error');
@@ -211,25 +228,22 @@ const DiscountManager: React.FC = () => {
     const items = state.groups[group];
     const meta = GROUP_META[group];
     try {
-      let reverted = 0;
-      for (const item of items) {
-        try {
-          const variant = await getVariantBySku(item.sku);
-          if (variant) {
-            await revertCompareAt(variant.id, item.price);
-            reverted++;
-          }
-        } catch (e) {
-          console.error(`[DiscountManager] shopify revert failed for ${item.sku}:`, e);
-        }
-      }
-      await revertPromotions(items);
+      const data = await callActivateSale('revert', {
+        group,
+        items: items.map(i => ({ sku: i.sku, price: i.price, group })),
+      });
+      const s = data.shopify || {};
+      const w = data.walmart || {};
       setState(prev => {
         const next = { ...prev.activeSales };
         delete next[group];
         return { activeSales: next };
       });
-      addLog(`Group ${meta.letter} reverted — Shopify (${reverted}/${items.length}) + Walmart BASE feed resubmitted.`, 'success');
+      addLog(
+        `Group ${meta.letter} reverted — Shopify (${s.reverted ?? 0}/${s.total ?? items.length}) + ` +
+        `Walmart ${w.submitted ? 'BASE feed resubmitted' : 'feed skipped'}.`,
+        'success',
+      );
     } catch (err: any) {
       console.error('[DiscountManager] revert failed:', err);
       addLog(`Revert Group ${meta.letter} failed: ${err?.message}`, 'error');
@@ -250,14 +264,24 @@ const DiscountManager: React.FC = () => {
     }));
     addLog(`Approved ${item.sku} → Group ${GROUP_META[group].letter}.`, 'success');
 
-    // If the target group is live, submit this single item to Walmart now.
+    // If the target group is live, apply Shopify compare_at + submit to
+    // Walmart for this single item now (server-side).
     const sale = state.activeSales[group];
     if (sale) {
       try {
-        await submitPromotions([item], sale.pct, group, state.promotionDuration);
-        addLog(`${item.sku} submitted to active Group ${GROUP_META[group].letter} Walmart promo.`, 'success');
+        const data = await callActivateSale('activate', {
+          group,
+          pct: sale.pct,
+          durationDays: state.promotionDuration,
+          items: [{ sku: item.sku, price: item.price, group }],
+        });
+        addLog(
+          `${item.sku} added to active Group ${GROUP_META[group].letter} ` +
+          `(Shopify ${data.shopify?.updated ?? 0}/1, Walmart ${data.walmart?.submitted ? 'ok' : 'skipped'}).`,
+          'success',
+        );
       } catch (err: any) {
-        addLog(`Failed to submit ${item.sku} to Walmart: ${err?.message}`, 'error');
+        addLog(`Failed to submit ${item.sku}: ${err?.message}`, 'error');
       }
     }
   }
