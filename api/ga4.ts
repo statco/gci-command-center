@@ -1,11 +1,13 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
+import crypto from 'node:crypto';
 
 const GA4_PROPERTY_ID = process.env.GA4_PROPERTY_ID;
-const GA4_CLIENT_ID = process.env.GA4_CLIENT_ID;
-const GA4_CLIENT_SECRET = process.env.GA4_CLIENT_SECRET;
-const GA4_REFRESH_TOKEN = process.env.GA4_REFRESH_TOKEN;
-// Must match an Authorized Redirect URI in Google Cloud Console → OAuth 2.0 credentials.
-const GA4_REDIRECT_URI = process.env.GA4_REDIRECT_URI || 'https://ops.gcitires.com/api/ga4?action=callback';
+// Service-account JSON key (the full file contents, or base64 of it).
+// Preferred over OAuth: no refresh tokens, never expires. The service account's
+// client_email must be added as a Viewer on the GA4 property.
+const GA4_SERVICE_ACCOUNT_KEY = process.env.GA4_SERVICE_ACCOUNT_KEY;
+
+const GA4_SCOPE = 'https://www.googleapis.com/auth/analytics.readonly';
 
 interface GA4ReportRow {
   dimensionValues?: Array<{ value?: string }>;
@@ -17,76 +19,97 @@ interface GA4ReportResponse {
   rowCount?: number;
 }
 
-class TokenExpiredError extends Error {
-  constructor(service: string, reauth: string) {
-    super(`${service} refresh token expired or revoked. Re-authenticate at: ${reauth}`);
-    this.name = 'TokenExpiredError';
+interface ServiceAccountKey {
+  client_email: string;
+  private_key: string;
+  token_uri?: string;
+}
+
+class GA4ConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'GA4ConfigError';
   }
 }
 
-function ga4AuthUrl(): string {
-  if (!GA4_CLIENT_ID) throw new Error('GA4_CLIENT_ID not set');
-  const params = new URLSearchParams({
-    response_type: 'code',
-    client_id: GA4_CLIENT_ID,
-    redirect_uri: GA4_REDIRECT_URI,
-    scope: 'https://www.googleapis.com/auth/analytics.readonly',
-    access_type: 'offline',
-    prompt: 'consent', // forces refresh_token to be returned even if previously authorized
-  });
-  return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+function base64url(input: Buffer | string): string {
+  return Buffer.from(input)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
 }
 
-async function exchangeGa4Code(code: string): Promise<{ refresh_token: string }> {
-  if (!GA4_CLIENT_ID) throw new Error('GA4_CLIENT_ID not set');
-  if (!GA4_CLIENT_SECRET) throw new Error('GA4_CLIENT_SECRET not set');
-  const res = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'authorization_code',
-      code,
-      client_id: GA4_CLIENT_ID,
-      client_secret: GA4_CLIENT_SECRET,
-      redirect_uri: GA4_REDIRECT_URI,
-    }),
-  });
-  if (!res.ok) {
-    const err = await res.json().catch(() => ({}));
-    throw new Error(`GA4 code exchange failed ${res.status}: ${JSON.stringify(err)}`);
+function loadServiceAccount(): ServiceAccountKey {
+  if (!GA4_SERVICE_ACCOUNT_KEY) {
+    throw new GA4ConfigError('GA4_SERVICE_ACCOUNT_KEY not set');
   }
-  const data = await res.json();
-  if (!data.refresh_token) throw new Error('No refresh_token returned — ensure prompt=consent was set in the auth URL');
-  return { refresh_token: data.refresh_token as string };
+  let raw = GA4_SERVICE_ACCOUNT_KEY.trim();
+  // Accept either raw JSON or base64-encoded JSON.
+  if (!raw.startsWith('{')) {
+    try {
+      raw = Buffer.from(raw, 'base64').toString('utf8');
+    } catch {
+      throw new GA4ConfigError('GA4_SERVICE_ACCOUNT_KEY is neither JSON nor valid base64');
+    }
+  }
+  let key: ServiceAccountKey;
+  try {
+    key = JSON.parse(raw);
+  } catch {
+    throw new GA4ConfigError('GA4_SERVICE_ACCOUNT_KEY is not valid JSON');
+  }
+  if (!key.client_email || !key.private_key) {
+    throw new GA4ConfigError('GA4_SERVICE_ACCOUNT_KEY missing client_email or private_key');
+  }
+  // Env vars often store the private key with literal "\n" — normalise to real newlines.
+  key.private_key = key.private_key.replace(/\\n/g, '\n');
+  return key;
 }
+
+// In-memory access-token cache (per warm lambda).
+let _token: string | null = null;
+let _tokenExp = 0;
 
 async function getAccessToken(): Promise<string> {
-  if (!GA4_CLIENT_ID) throw new Error('GA4_CLIENT_ID not set');
-  if (!GA4_CLIENT_SECRET) throw new Error('GA4_CLIENT_SECRET not set');
-  if (!GA4_REFRESH_TOKEN) throw new TokenExpiredError('GA4', ga4AuthUrl());
+  if (_token && Date.now() < _tokenExp - 60_000) return _token;
 
-  const res = await fetch('https://oauth2.googleapis.com/token', {
+  const sa = loadServiceAccount();
+  const tokenUri = sa.token_uri || 'https://oauth2.googleapis.com/token';
+  const now = Math.floor(Date.now() / 1000);
+
+  const header = base64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
+  const claims = base64url(JSON.stringify({
+    iss: sa.client_email,
+    scope: GA4_SCOPE,
+    aud: tokenUri,
+    iat: now,
+    exp: now + 3600,
+  }));
+  const signingInput = `${header}.${claims}`;
+  const signature = base64url(
+    crypto.createSign('RSA-SHA256').update(signingInput).sign(sa.private_key),
+  );
+  const assertion = `${signingInput}.${signature}`;
+
+  const res = await fetch(tokenUri, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
-      grant_type: 'refresh_token',
-      client_id: GA4_CLIENT_ID,
-      client_secret: GA4_CLIENT_SECRET,
-      refresh_token: GA4_REFRESH_TOKEN,
+      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
+      assertion,
     }),
   });
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    // invalid_grant = token revoked/expired; surface a 401 with the reauth URL
-    if ((err as any)?.error === 'invalid_grant') {
-      throw new TokenExpiredError('GA4', ga4AuthUrl());
-    }
-    throw new Error(`OAuth2 token exchange failed ${res.status}: ${JSON.stringify(err)}`);
+    throw new Error(`GA4 service-account token exchange failed ${res.status}: ${JSON.stringify(err)}`);
   }
 
   const data = await res.json();
-  return data.access_token as string;
+  _token = data.access_token as string;
+  _tokenExp = Date.now() + ((data.expires_in as number ?? 3600) * 1000);
+  return _token!;
 }
 
 async function runReport(
@@ -141,33 +164,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).json({ error: 'Method not allowed' });
   }
 
-  const { action, code, report, startDate, endDate } = req.query;
-
-  // ── OAuth re-authentication endpoints ───────────────────────
-  if (action === 'auth-url') {
-    try {
-      return res.status(200).json({
-        message: 'Open this URL in a browser to re-authenticate GA4',
-        url: ga4AuthUrl(),
-        next: 'After authorizing, copy the GA4_REFRESH_TOKEN from the callback response into Vercel env vars',
-      });
-    } catch (err: any) {
-      return res.status(500).json({ error: err.message });
-    }
-  }
-
-  if (action === 'callback') {
-    if (!code) return res.status(400).json({ error: 'Missing code parameter' });
-    try {
-      const result = await exchangeGa4Code(code as string);
-      return res.status(200).json({
-        message: 'Copy this value into your Vercel environment variables, then redeploy',
-        GA4_REFRESH_TOKEN: result.refresh_token,
-      });
-    } catch (err: any) {
-      return res.status(500).json({ error: err.message });
-    }
-  }
+  const { report, startDate, endDate } = req.query;
 
   const start = (startDate as string) || '7daysAgo';
   const end = (endDate as string) || 'today';
@@ -210,11 +207,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
   } catch (err: any) {
     console.error('[ga4 api]', err);
-    if (err instanceof TokenExpiredError) {
-      return res.status(401).json({
-        error: 'GA4_REFRESH_TOKEN expired or revoked',
-        code: 'TOKEN_EXPIRED',
-        reauth: 'GET /api/ga4?action=auth-url',
+    if (err instanceof GA4ConfigError) {
+      return res.status(500).json({
+        error: err.message,
+        code: 'GA4_CONFIG_ERROR',
+        hint: 'Set GA4_SERVICE_ACCOUNT_KEY (service-account JSON) and add the service account email as a Viewer on the GA4 property.',
       });
     }
     return res.status(500).json({ error: err?.message || 'Internal server error' });
