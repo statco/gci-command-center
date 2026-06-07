@@ -1,7 +1,10 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node';
 import crypto from 'node:crypto';
 
-const GA4_PROPERTY_ID = process.env.GA4_PROPERTY_ID;
+// Trim + strip any non-digit chars (e.g. a stray newline pasted into the env
+// var, or an accidental "properties/" prefix). The Data API needs the bare
+// numeric property id.
+const GA4_PROPERTY_ID = (process.env.GA4_PROPERTY_ID || '').replace(/\D/g, '');
 // Service-account JSON key (the full file contents, or base64 of it).
 // Preferred over OAuth: no refresh tokens, never expires. The service account's
 // client_email must be added as a Viewer on the GA4 property.
@@ -140,7 +143,7 @@ async function runReport(
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(`GA4 runReport failed ${res.status}: ${JSON.stringify(err)}`);
+    throw new Error(`GA4 runReport failed ${res.status} (property ${GA4_PROPERTY_ID}): ${JSON.stringify(err)}`);
   }
 
   const data: GA4ReportResponse = await res.json();
