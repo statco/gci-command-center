@@ -68,15 +68,17 @@ async function getWalmartToken(): Promise<string> {
 }
 
 function walmartHeaders(token: string): Record<string, string> {
+  // NOTE: WM_CONSUMER.CHANNEL.TYPE is intentionally NOT sent. The proven
+  // gci-walmart-sync client omits it on the same /v3/ca/feeds?feedType=price
+  // endpoint. The previous 'SWAGGER_WALMART_CA_MARKETPLACE' value was a Swagger
+  // placeholder, not a real consumer-channel-type GUID, and produced the
+  // "WM_CONSUMER.CHANNEL.TYPE set null or invalid" 400 on feed submission.
   return {
     'WM_SEC.ACCESS_TOKEN': token,
     'WM_GLOBAL_VERSION': '3.1',
     'WM_MARKET': 'ca',
     'WM_SVC.NAME': 'Walmart Marketplace',
     'WM_QOS.CORRELATION_ID': crypto.randomUUID(),
-    // Walmart CANADA marketplace channel type. Required on feed submissions;
-    // a null/invalid value yields INVALID_REQUEST_HEADER.GMP_GATEWAY_API.
-    'WM_CONSUMER.CHANNEL.TYPE': 'SWAGGER_WALMART_CA_MARKETPLACE',
     'Content-Type': 'application/json',
     Accept: 'application/json',
   };

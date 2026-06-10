@@ -37,7 +37,8 @@ const SHOPIFY_API_VERSION = '2024-01';
 
 const PROXY_SECRET = process.env.PROXY_SECRET || '';
 const SHOPIFY_RATE_DELAY_MS = 250; // Shopify Basic ≈ 2 req/s
-const EFFECTIVE_LEAD_HOURS = 5;     // Walmart ≥4h rule + 1h buffer
+const WALMART_RATE_DELAY_MS = 150; // gentle spacing between per-SKU price PUTs
+const EFFECTIVE_LEAD_HOURS = 5;     // Walmart ≥4h rule + 1h buffer (UI display only)
 
 const delay = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
 
@@ -222,70 +223,108 @@ function buildPromoDates(durationDays: number) {
   return { effectiveDate: effective.toISOString(), expirationDate: expiration.toISOString() };
 }
 
+interface WalmartWriteResult {
+  updated: number;
+  failed: number;
+  failures: { sku: string; status: number; error: string }[];
+}
+
+// Synchronous per-SKU price write to the Walmart Global Marketplace endpoint
+// PUT /v3/price (NOT the legacy /v3/ca/feeds). This is the exact endpoint the
+// proven gci-order-hub and gci-walmart-sync clients use for Walmart CA: /v3/*
+// with WM_MARKET:ca and NO WM_CONSUMER.CHANNEL.TYPE. The /v3/ca/* family is
+// what required that header and produced the recurring
+// "WM_CONSUMER.CHANNEL.TYPE set null or invalid" 400. This endpoint applies
+// immediately (no feedId / async polling, no effective/expiration window).
+async function putWalmartPrice(
+  token: string,
+  sku: string,
+  pricing: Record<string, unknown>,
+): Promise<{ ok: boolean; status: number; text: string }> {
+  const res = await fetch(`${WALMART_BASE}/v3/price`, {
+    method: 'PUT',
+    headers: walmartHeaders(token),
+    body: JSON.stringify({ sku, pricing: [pricing] }),
+  });
+  if (res.status === 429) {
+    await delay(2000);
+    return putWalmartPrice(token, sku, pricing);
+  }
+  const text = await res.text();
+  return { ok: res.ok, status: res.status, text };
+}
+
 async function submitWalmartPromo(
   items: CollectedItem[],
   pct: number,
   groupTier: GroupTier,
-  durationDays: number,
-): Promise<{ feedId?: string; feedStatus?: string; raw?: any }> {
+): Promise<WalmartWriteResult> {
   const token = await getWalmartToken();
-  const { effectiveDate, expirationDate } = buildPromoDates(durationDays);
   const currentPriceType = groupTier === 'high' ? 'CLEARANCE' : 'REDUCED';
+  console.log('[activate-sale] Walmart price PUT → /v3/price', 'items:', items.length, 'type:', currentPriceType,
+    'headers:', JSON.stringify(redactWalmartHeaders(walmartHeaders(token))));
 
-  const payload = {
-    PriceHeader: { version: '1.7' },
-    Price: items.map(it => ({
-      itemIdentifier: { sku: it.sku },
-      pricingList: {
-        pricing: [{
-          currentPriceType,
-          currentPrice: { currentPrice: { currency: 'CAD', amount: round2(it.originalPrice * (1 - pct / 100)) } },
-          comparisonPrice: { currency: 'CAD', amount: it.originalPrice },
-          priceDisplayCode: { submitDecisionCode: 'true' },
-          effectiveDate,
-          expirationDate,
-        }],
-      },
-    })),
-  };
+  let updated = 0;
+  const failures: { sku: string; status: number; error: string }[] = [];
 
-  const url = `${WALMART_BASE}/v3/ca/feeds?feedType=price`;
-  const headers = walmartHeaders(token);
-  console.log('[activate-sale] Walmart promo feed →', url, 'items:', items.length,
-    'headers:', JSON.stringify(redactWalmartHeaders(headers)));
-  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
-  const text = await res.text();
-  console.log('[activate-sale] Walmart promo feed ←', res.status, text.slice(0, 300));
-  if (!res.ok) throw new Error(`Walmart feed ${res.status}: ${text.slice(0, 200)}`);
-  const json = text ? JSON.parse(text) : {};
-  return { feedId: json.feedId, feedStatus: json.feedStatus, raw: json };
+  for (const it of items) {
+    const salePrice = round2(it.originalPrice * (1 - pct / 100));
+    const pricing = {
+      currentPriceType,
+      currentPrice: { currency: 'CAD', amount: salePrice },
+      // Strikethrough "was" price = the original Shopify price.
+      comparisonPrice: { currency: 'CAD', amount: round2(it.originalPrice) },
+      comparisonPriceType: 'BASE',
+    };
+    const r = await putWalmartPrice(token, it.sku, pricing);
+    if (r.ok) {
+      updated++;
+    } else {
+      console.error(`[activate-sale] Walmart price ${it.sku} ✗ ${r.status}: ${r.text.slice(0, 200)}`);
+      failures.push({ sku: it.sku, status: r.status, error: r.text.slice(0, 200) });
+    }
+    await delay(WALMART_RATE_DELAY_MS);
+  }
+
+  console.log(`[activate-sale] Walmart price done: ${updated} updated, ${failures.length} failed`);
+  // Throw only if EVERY SKU failed — partial success still marks the promo live.
+  if (updated === 0) {
+    const f = failures[0];
+    throw new Error(`Walmart price PUT failed for all ${items.length} SKU(s): ${f ? `${f.status} ${f.error}` : 'unknown'}`);
+  }
+  return { updated, failed: failures.length, failures };
 }
 
-async function submitWalmartRevert(items: CollectedItem[]): Promise<{ feedId?: string; raw?: any }> {
+async function submitWalmartRevert(items: CollectedItem[]): Promise<WalmartWriteResult> {
   const token = await getWalmartToken();
-  const payload = {
-    PriceHeader: { version: '1.7' },
-    replaceAll: true,
-    Price: items.map(it => ({
-      itemIdentifier: { sku: it.sku },
-      pricingList: {
-        pricing: [{
-          currentPriceType: 'BASE',
-          currentPrice: { currentPrice: { currency: 'CAD', amount: it.originalPrice } },
-        }],
-      },
-    })),
-  };
-  const url = `${WALMART_BASE}/v3/ca/feeds?feedType=price`;
-  const headers = walmartHeaders(token);
-  console.log('[activate-sale] Walmart revert feed →', url, 'items:', items.length,
-    'headers:', JSON.stringify(redactWalmartHeaders(headers)));
-  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
-  const text = await res.text();
-  console.log('[activate-sale] Walmart revert feed ←', res.status, text.slice(0, 300));
-  if (!res.ok) throw new Error(`Walmart revert feed ${res.status}: ${text.slice(0, 200)}`);
-  const json = text ? JSON.parse(text) : {};
-  return { feedId: json.feedId, raw: json };
+  console.log('[activate-sale] Walmart revert PUT → /v3/price', 'items:', items.length,
+    'headers:', JSON.stringify(redactWalmartHeaders(walmartHeaders(token))));
+
+  let updated = 0;
+  const failures: { sku: string; status: number; error: string }[] = [];
+
+  for (const it of items) {
+    // Restore the original price as BASE — clears the promo.
+    const pricing = {
+      currentPriceType: 'BASE',
+      currentPrice: { currency: 'CAD', amount: round2(it.originalPrice) },
+    };
+    const r = await putWalmartPrice(token, it.sku, pricing);
+    if (r.ok) {
+      updated++;
+    } else {
+      console.error(`[activate-sale] Walmart revert ${it.sku} ✗ ${r.status}: ${r.text.slice(0, 200)}`);
+      failures.push({ sku: it.sku, status: r.status, error: r.text.slice(0, 200) });
+    }
+    await delay(WALMART_RATE_DELAY_MS);
+  }
+
+  console.log(`[activate-sale] Walmart revert done: ${updated} updated, ${failures.length} failed`);
+  if (updated === 0) {
+    const f = failures[0];
+    throw new Error(`Walmart revert PUT failed for all ${items.length} SKU(s): ${f ? `${f.status} ${f.error}` : 'unknown'}`);
+  }
+  return { updated, failed: failures.length, failures };
 }
 
 // ─── Origin / secret validation (mirrors discount-proxy) ──────
@@ -402,12 +441,19 @@ async function handleActivate(
       walmart = { submitted: false, dry: true, wouldSubmit: collected.length };
     } else {
       try {
-        const feed = await submitWalmartPromo(collected, pct, group, durationDays);
-        const { effectiveDate, expirationDate } = buildPromoDates(durationDays);
+        const result = await submitWalmartPromo(collected, pct, group);
+        // PUT /v3/price applies immediately — effective now. expirationDate is
+        // informational for the UI (when to revert); Walmart holds the price
+        // until the revert call.
+        const effectiveDate = new Date().toISOString();
+        const { expirationDate } = buildPromoDates(durationDays);
         walmart = {
           submitted: true,
-          feedId: feed.feedId ?? 'pending',
-          feedStatus: feed.feedStatus ?? 'RECEIVED',
+          feedId: 'sync-immediate',
+          feedStatus: 'APPLIED',
+          updated: result.updated,
+          failed: result.failed,
+          failures: result.failures,
           effectiveDate,
           expirationDate,
           promotionType: group === 'high' ? 'CLEARANCE' : 'REDUCED',
@@ -463,8 +509,14 @@ async function handleRevert(
       walmart = { submitted: false, dry: true, wouldSubmit: collected.length };
     } else {
       try {
-        const feed = await submitWalmartRevert(collected);
-        walmart = { submitted: true, feedId: feed.feedId ?? 'pending' };
+        const result = await submitWalmartRevert(collected);
+        walmart = {
+          submitted: true,
+          feedId: 'sync-immediate',
+          updated: result.updated,
+          failed: result.failed,
+          failures: result.failures,
+        };
       } catch (e: any) {
         walmart = { submitted: false, error: e?.message || String(e) };
       }
