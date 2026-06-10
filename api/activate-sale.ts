@@ -100,17 +100,33 @@ async function getWalmartToken(): Promise<string> {
 }
 
 function walmartHeaders(token: string): Record<string, string> {
-  return {
+  const h: Record<string, string> = {
     'WM_SEC.ACCESS_TOKEN': token,
     'WM_GLOBAL_VERSION': '3.1',
     'WM_MARKET': 'ca',
     'WM_SVC.NAME': 'Walmart Marketplace',
     'WM_QOS.CORRELATION_ID': crypto.randomUUID(),
-    // Walmart CANADA marketplace channel type — required on feed submissions.
-    'WM_CONSUMER.CHANNEL.TYPE': 'SWAGGER_WALMART_CA_MARKETPLACE',
     'Content-Type': 'application/json',
     Accept: 'application/json',
   };
+  // WM_CONSUMER.CHANNEL.TYPE is NOT required for Walmart CA feed submissions.
+  // The proven gci-walmart-sync client posts to the same /v3/ca/feeds endpoint
+  // without it. The previous hardcoded 'SWAGGER_WALMART_CA_MARKETPLACE' was a
+  // Swagger doc placeholder — not a real consumer-channel-type GUID — and was
+  // the cause of the "WM_CONSUMER.CHANNEL.TYPE null or invalid" 400. Only send
+  // the header if a genuine GUID is supplied via env (else omit it entirely).
+  const channelType = (process.env.WALMART_CONSUMER_CHANNEL_TYPE || '').trim();
+  if (channelType) h['WM_CONSUMER.CHANNEL.TYPE'] = channelType;
+  return h;
+}
+
+// Redacts the bearer token before logging Walmart request headers.
+function redactWalmartHeaders(h: Record<string, string>): Record<string, string> {
+  const out = { ...h };
+  if (out['WM_SEC.ACCESS_TOKEN']) {
+    out['WM_SEC.ACCESS_TOKEN'] = `<redacted ${out['WM_SEC.ACCESS_TOKEN'].length} chars>`;
+  }
+  return out;
 }
 
 // ─── Shopify helpers ──────────────────────────────────────────
@@ -130,18 +146,53 @@ function isTireSku(sku: string): boolean {
   return typeof sku === 'string' && sku.toUpperCase().startsWith('TIRE-');
 }
 
-async function getVariantBySku(sku: string): Promise<ShopifyVariant | null> {
-  const res = await fetch(
-    `${shopifyBase()}/variants.json?sku=${encodeURIComponent(sku)}&limit=1`,
-    { headers: shopifyHeaders() },
-  );
+// Shopify Admin GraphQL POST. The REST endpoint /variants.json does NOT support
+// a ?sku= filter (there is no top-level variant listing keyed by SKU), which is
+// why the old lookup matched nothing and every variant came back 0/N. GraphQL's
+// productVariants(query: "sku:...") is the supported way to resolve a SKU.
+async function shopifyGraphQL<T>(query: string, variables: Record<string, unknown>): Promise<T> {
+  const res = await fetch(`${shopifyBase()}/graphql.json`, {
+    method: 'POST',
+    headers: shopifyHeaders(),
+    body: JSON.stringify({ query, variables }),
+  });
   if (res.status === 429) {
     await delay(2000);
-    return getVariantBySku(sku);
+    return shopifyGraphQL<T>(query, variables);
   }
-  if (!res.ok) throw new Error(`Shopify variant lookup ${res.status}`);
-  const data: any = await res.json();
-  return (data.variants || [])[0] ?? null;
+  if (!res.ok) throw new Error(`Shopify GraphQL ${res.status}: ${(await res.text()).slice(0, 200)}`);
+  const json: any = await res.json();
+  if (json.errors) throw new Error(`Shopify GraphQL error: ${JSON.stringify(json.errors).slice(0, 200)}`);
+  return json.data as T;
+}
+
+// gid://shopify/ProductVariant/123456 → 123456 (REST PUT still keys on numeric id).
+function gidToId(gid: string): number {
+  const m = String(gid).match(/(\d+)\s*$/);
+  return m ? parseInt(m[1], 10) : NaN;
+}
+
+async function getVariantBySku(sku: string): Promise<ShopifyVariant | null> {
+  const data = await shopifyGraphQL<{
+    productVariants: { edges: { node: { id: string; sku: string | null; price: string; compareAtPrice: string | null } }[] };
+  }>(
+    `query VariantBySku($q: String!) {
+       productVariants(first: 10, query: $q) {
+         edges { node { id sku price compareAtPrice } }
+       }
+     }`,
+    { q: `sku:${sku}` },
+  );
+  const edges = data?.productVariants?.edges || [];
+  // productVariants `sku:` search is tokenized — verify an exact match.
+  const match = edges.find(e => (e.node.sku || '').toLowerCase() === sku.toLowerCase());
+  if (!match) return null;
+  return {
+    id: gidToId(match.node.id),
+    sku: match.node.sku || sku,
+    price: match.node.price,
+    compare_at_price: match.node.compareAtPrice ?? null,
+  };
 }
 
 async function putVariant(
@@ -198,12 +249,13 @@ async function submitWalmartPromo(
     })),
   };
 
-  const res = await fetch(`${WALMART_BASE}/v3/ca/feeds?feedType=price`, {
-    method: 'POST',
-    headers: walmartHeaders(token),
-    body: JSON.stringify(payload),
-  });
+  const url = `${WALMART_BASE}/v3/ca/feeds?feedType=price`;
+  const headers = walmartHeaders(token);
+  console.log('[activate-sale] Walmart promo feed →', url, 'items:', items.length,
+    'headers:', JSON.stringify(redactWalmartHeaders(headers)));
+  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
   const text = await res.text();
+  console.log('[activate-sale] Walmart promo feed ←', res.status, text.slice(0, 300));
   if (!res.ok) throw new Error(`Walmart feed ${res.status}: ${text.slice(0, 200)}`);
   const json = text ? JSON.parse(text) : {};
   return { feedId: json.feedId, feedStatus: json.feedStatus, raw: json };
@@ -224,12 +276,13 @@ async function submitWalmartRevert(items: CollectedItem[]): Promise<{ feedId?: s
       },
     })),
   };
-  const res = await fetch(`${WALMART_BASE}/v3/ca/feeds?feedType=price`, {
-    method: 'POST',
-    headers: walmartHeaders(token),
-    body: JSON.stringify(payload),
-  });
+  const url = `${WALMART_BASE}/v3/ca/feeds?feedType=price`;
+  const headers = walmartHeaders(token);
+  console.log('[activate-sale] Walmart revert feed →', url, 'items:', items.length,
+    'headers:', JSON.stringify(redactWalmartHeaders(headers)));
+  const res = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload) });
   const text = await res.text();
+  console.log('[activate-sale] Walmart revert feed ←', res.status, text.slice(0, 300));
   if (!res.ok) throw new Error(`Walmart revert feed ${res.status}: ${text.slice(0, 200)}`);
   const json = text ? JSON.parse(text) : {};
   return { feedId: json.feedId, raw: json };
@@ -278,6 +331,19 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(400).json({ error: 'No TIRE- SKUs provided', code: 400 });
   }
 
+  // Startup diagnostic — confirms which env is wired up without leaking secrets.
+  console.log('[activate-sale] start', JSON.stringify({
+    action,
+    dry,
+    items: items.length,
+    shopifyDomain: SHOPIFY_DOMAIN,
+    shopifyTokenSet: !!SHOPIFY_TOKEN,
+    shopifyTokenLen: SHOPIFY_TOKEN.length,
+    walmartClientIdSet: !!process.env.WALMART_CLIENT_ID,
+    walmartClientSecretSet: !!process.env.WALMART_CLIENT_SECRET,
+    walmartChannelType: (process.env.WALMART_CONSUMER_CHANNEL_TYPE || '').trim() ? 'set' : 'omitted',
+  }));
+
   try {
     if (action === 'revert') {
       return await handleRevert(req, res, items, dry);
@@ -308,7 +374,11 @@ async function handleActivate(
   for (const item of items) {
     try {
       const variant = await getVariantBySku(item.sku);
-      if (!variant) { skipped++; continue; }
+      if (!variant) {
+        console.log(`[activate-sale] ${item.sku}: no Shopify variant found — skipped`);
+        skipped++; continue;
+      }
+      console.log(`[activate-sale] ${item.sku}: variant ${variant.id} price=${variant.price} compareAt=${variant.compare_at_price ?? 'null'}`);
       const originalPrice = parseFloat(variant.price) || item.price || 0;
       if (!dry) {
         await putVariant(variant.id, {
@@ -364,7 +434,11 @@ async function handleRevert(
   for (const item of items) {
     try {
       const variant = await getVariantBySku(item.sku);
-      if (!variant) { skipped++; continue; }
+      if (!variant) {
+        console.log(`[activate-sale] revert ${item.sku}: no Shopify variant found — skipped`);
+        skipped++; continue;
+      }
+      console.log(`[activate-sale] revert ${item.sku}: variant ${variant.id} price=${variant.price} compareAt=${variant.compare_at_price ?? 'null'}`);
       // The original price is whatever we previously stashed in compare_at_price.
       const originalPrice =
         parseFloat(variant.compare_at_price || '') || parseFloat(variant.price) || item.price || 0;
