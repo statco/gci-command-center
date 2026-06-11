@@ -191,7 +191,7 @@ const DiscountManager: React.FC = () => {
         group,
         pct,
         durationDays: state.promotionDuration,
-        items: items.map(i => ({ sku: i.sku, price: i.price, group })),
+        items: items.map(i => ({ sku: i.sku, price: i.price, group, shopifyVariantId: i.shopifyVariantId })),
       });
 
       const s = data.shopify || {};
@@ -243,7 +243,7 @@ const DiscountManager: React.FC = () => {
     try {
       const data = await callActivateSale('revert', {
         group,
-        items: items.map(i => ({ sku: i.sku, price: i.price, group })),
+        items: items.map(i => ({ sku: i.sku, price: i.price, group, shopifyVariantId: i.shopifyVariantId })),
       });
       const s = data.shopify || {};
       const w = data.walmart || {};
@@ -286,7 +286,7 @@ const DiscountManager: React.FC = () => {
           group,
           pct: sale.pct,
           durationDays: state.promotionDuration,
-          items: [{ sku: item.sku, price: item.price, group }],
+          items: [{ sku: item.sku, price: item.price, group, shopifyVariantId: item.shopifyVariantId }],
         });
         addLog(
           `${item.sku} added to active Group ${GROUP_META[group].letter} ` +
