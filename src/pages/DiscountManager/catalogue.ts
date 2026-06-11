@@ -16,14 +16,16 @@
 
 export interface CatalogueItem {
   id: string;
-  sku: string;          // TIRE-XXXXXX
-  offerId: string;      // Walmart offerId
+  sku: string;               // TIRE-XXXXXX
+  offerId: string;           // legacy Walmart offerId (= sku for Shopify-sourced items)
   gtin: string;
-  price: number;        // current Walmart price (CAD)
+  price: number;             // current price (CAD)
   title: string;
   group: 'low' | 'mid' | 'high';
-  addedAt?: string;     // ISO — set when auto-added by cron
-  autoAdded?: boolean;  // true if added by nightly refresh
+  shopifyProductId?: string; // gid://shopify/Product/…
+  shopifyVariantId?: number; // numeric Shopify variant ID (pre-resolved)
+  addedAt?: string;          // ISO — set when auto-added by cron
+  autoAdded?: boolean;       // true if added by nightly refresh
 }
 
 // ─── Deterministic pseudo-random (mulberry32) ────────────────────

@@ -47,8 +47,9 @@ type GroupTier = 'low' | 'mid' | 'high';
 
 interface IncomingItem {
   sku: string;
-  price?: number; // catalogue price (fallback only; Shopify price wins)
+  price?: number;             // catalogue price (fallback only; Shopify price wins)
   group?: GroupTier;
+  shopifyVariantId?: number;  // pre-resolved from catalogue — skips GraphQL lookup
 }
 
 interface CollectedItem {
@@ -212,6 +213,29 @@ async function getVariantBySku(sku: string): Promise<ShopifyVariant | null> {
     sku: match.node.sku || sku,
     price: match.node.price,
     compare_at_price: match.node.compareAtPrice ?? null,
+  };
+}
+
+// Direct REST lookup by numeric variant ID — much cheaper than the GraphQL
+// search-by-SKU query. Used when the catalogue provides a pre-resolved ID.
+async function getVariantById(variantId: number): Promise<ShopifyVariant | null> {
+  const res = await fetch(`${shopifyBase()}/variants/${variantId}.json`, {
+    headers: shopifyHeaders(),
+  });
+  if (res.status === 404) return null;
+  if (res.status === 429) {
+    await delay(2000);
+    return getVariantById(variantId);
+  }
+  if (!res.ok) throw new Error(`Shopify variant GET ${res.status}`);
+  const data: any = await res.json();
+  const v = data?.variant;
+  if (!v) return null;
+  return {
+    id: v.id,
+    sku: v.sku || '',
+    price: String(v.price),
+    compare_at_price: v.compare_at_price != null ? String(v.compare_at_price) : null,
   };
 }
 
@@ -431,16 +455,16 @@ async function handleActivate(
 
   for (const item of items) {
     try {
-      const variant = await getVariantBySku(item.sku);
+      // Pre-resolved variant ID from the catalogue skips the expensive
+      // GraphQL search-by-SKU query. Falls back to GraphQL if not provided.
+      const variant = item.shopifyVariantId
+        ? await getVariantById(item.shopifyVariantId)
+        : await getVariantBySku(item.sku);
       if (!variant) {
         console.log(`[activate-sale] ${item.sku}: no Shopify variant found — skipped`);
         skipped++; continue;
       }
       console.log(`[activate-sale] ${item.sku}: variant ${variant.id} price=${variant.price} compareAt=${variant.compare_at_price ?? 'null'}`);
-      // Compounding-discount safeguard: if compare_at_price is already set, this
-      // variant is already on sale (someone activated without reverting). Use
-      // the stashed compare_at_price as the true original so we don't discount a
-      // price that's already discounted.
       const compareAt = parseFloat(variant.compare_at_price || '');
       const alreadyDiscounted = Number.isFinite(compareAt) && compareAt > 0;
       const originalPrice = alreadyDiscounted
@@ -516,7 +540,9 @@ async function handleRevert(
     let variantId: number | string | null = null;
 
     try {
-      const variant = await getVariantBySku(item.sku);
+      const variant = item.shopifyVariantId
+        ? await getVariantById(item.shopifyVariantId)
+        : await getVariantBySku(item.sku);
       if (!variant) {
         console.log(`[activate-sale] revert ${item.sku}: no variant — Shopify skip (Walmart will still restore $${originalPrice || '?'})`);
         skipped++;
