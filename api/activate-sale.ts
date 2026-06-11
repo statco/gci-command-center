@@ -151,19 +151,38 @@ function isTireSku(sku: string): boolean {
 // a ?sku= filter (there is no top-level variant listing keyed by SKU), which is
 // why the old lookup matched nothing and every variant came back 0/N. GraphQL's
 // productVariants(query: "sku:...") is the supported way to resolve a SKU.
-async function shopifyGraphQL<T>(query: string, variables: Record<string, unknown>): Promise<T> {
+async function shopifyGraphQL<T>(
+  query: string,
+  variables: Record<string, unknown>,
+  attempt = 0,
+): Promise<T> {
+  const MAX_ATTEMPTS = 6;
   const res = await fetch(`${shopifyBase()}/graphql.json`, {
     method: 'POST',
     headers: shopifyHeaders(),
     body: JSON.stringify({ query, variables }),
   });
   if (res.status === 429) {
+    if (attempt >= MAX_ATTEMPTS) throw new Error('Shopify GraphQL 429: rate limited after retries');
     await delay(2000);
-    return shopifyGraphQL<T>(query, variables);
+    return shopifyGraphQL<T>(query, variables, attempt + 1);
   }
   if (!res.ok) throw new Error(`Shopify GraphQL ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const json: any = await res.json();
-  if (json.errors) throw new Error(`Shopify GraphQL error: ${JSON.stringify(json.errors).slice(0, 200)}`);
+  if (json.errors) {
+    // Shopify's cost-based limiter returns HTTP 200 with a THROTTLED error
+    // rather than a 429. Retry these with backoff instead of failing the SKU —
+    // this is the cause of revert only touching a handful of variants when it
+    // runs right after activate has drained the GraphQL cost bucket.
+    const throttled = Array.isArray(json.errors) && json.errors.some(
+      (e: any) => e?.extensions?.code === 'THROTTLED' || /throttl/i.test(e?.message || ''),
+    );
+    if (throttled && attempt < MAX_ATTEMPTS) {
+      await delay(2000);
+      return shopifyGraphQL<T>(query, variables, attempt + 1);
+    }
+    throw new Error(`Shopify GraphQL error: ${JSON.stringify(json.errors).slice(0, 200)}`);
+  }
   return json.data as T;
 }
 
@@ -484,53 +503,73 @@ async function handleRevert(
   items: IncomingItem[],
   dry: boolean,
 ) {
-  const collected: CollectedItem[] = [];
+  const collected: CollectedItem[] = [];          // Shopify variants actually reverted
+  const walmartItems: CollectedItem[] = [];        // every SKU to restore on Walmart
   const failed: { sku: string; error: string }[] = [];
   let skipped = 0;
 
   for (const item of items) {
+    // Best-known original price: the catalogue price from the request is the
+    // fallback so Walmart can still be restored even if the Shopify lookup
+    // fails or the variant is gone.
+    let originalPrice = item.price || 0;
+    let variantId: number | string | null = null;
+
     try {
       const variant = await getVariantBySku(item.sku);
       if (!variant) {
-        console.log(`[activate-sale] revert ${item.sku}: no Shopify variant found — skipped`);
-        skipped++; continue;
+        console.log(`[activate-sale] revert ${item.sku}: no variant — Shopify skip (Walmart will still restore $${originalPrice || '?'})`);
+        skipped++;
+      } else {
+        // Original price is whatever we previously stashed in compare_at_price;
+        // fall back to the live price, then the request price.
+        const stashed = parseFloat(variant.compare_at_price || '');
+        originalPrice = (Number.isFinite(stashed) && stashed > 0)
+          ? stashed
+          : (parseFloat(variant.price) || item.price || 0);
+        variantId = variant.id;
+        console.log(`[activate-sale] revert ${item.sku}: found variant ${variant.id}, restoring $${originalPrice} (compareAt=${variant.compare_at_price ?? 'null'})`);
+        if (!dry) {
+          await putVariant(variant.id, { price: originalPrice.toFixed(2), compare_at_price: null });
+          await delay(SHOPIFY_RATE_DELAY_MS);
+        }
+        collected.push({ sku: item.sku, variantId: variant.id, originalPrice });
       }
-      console.log(`[activate-sale] revert ${item.sku}: variant ${variant.id} price=${variant.price} compareAt=${variant.compare_at_price ?? 'null'}`);
-      // The original price is whatever we previously stashed in compare_at_price.
-      const originalPrice =
-        parseFloat(variant.compare_at_price || '') || parseFloat(variant.price) || item.price || 0;
-      if (!dry) {
-        await putVariant(variant.id, {
-          price: originalPrice.toFixed(2),
-          compare_at_price: null,
-        });
-        await delay(SHOPIFY_RATE_DELAY_MS);
-      }
-      collected.push({ sku: item.sku, variantId: variant.id, originalPrice });
     } catch (e: any) {
-      failed.push({ sku: item.sku, error: e?.message || String(e) });
+      const msg = e?.message || String(e);
+      console.error(`[activate-sale] revert ${item.sku}: error — ${msg}`);
+      failed.push({ sku: item.sku, error: msg });
+    }
+
+    // BUG 3: always queue for Walmart restore regardless of the Shopify outcome,
+    // as long as we have a usable original price.
+    if (originalPrice > 0) {
+      walmartItems.push({ sku: item.sku, variantId: variantId ?? item.sku, originalPrice });
+    } else {
+      console.log(`[activate-sale] revert ${item.sku}: no usable original price — cannot restore on Walmart`);
     }
   }
 
   const shopify = { reverted: collected.length, skipped, total: items.length, failed };
+  console.log(`[activate-sale] revert summary: Shopify reverted ${collected.length}/${items.length} (skipped ${skipped}, failed ${failed.length}); Walmart restore queued ${walmartItems.length}`);
 
-  let walmart: any = { submitted: false, reason: 'no Shopify variants reverted' };
-  if (collected.length > 0) {
-    if (dry) {
-      walmart = { submitted: false, dry: true, wouldSubmit: collected.length };
-    } else {
-      try {
-        const result = await submitWalmartRevert(collected);
-        walmart = {
-          submitted: true,
-          feedId: 'sync-immediate',
-          updated: result.updated,
-          failed: result.failed,
-          failures: result.failures,
-        };
-      } catch (e: any) {
-        walmart = { submitted: false, error: e?.message || String(e) };
-      }
+  // BUG 3: Walmart restore is no longer gated on Shopify reverting ≥1 variant —
+  // always push the original prices back for every SKU in the group.
+  let walmart: any = { submitted: false, reason: 'no SKUs with a usable original price' };
+  if (dry) {
+    walmart = { submitted: false, dry: true, wouldSubmit: walmartItems.length };
+  } else if (walmartItems.length > 0) {
+    try {
+      const result = await submitWalmartRevert(walmartItems);
+      walmart = {
+        submitted: true,
+        feedId: 'sync-immediate',
+        updated: result.updated,
+        failed: result.failed,
+        failures: result.failures,
+      };
+    } catch (e: any) {
+      walmart = { submitted: false, error: e?.message || String(e) };
     }
   }
 

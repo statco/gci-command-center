@@ -30,9 +30,22 @@ async function callActivateSale(
   });
   const data = await res.json().catch(() => ({}));
   if (!res.ok || !data?.success) {
-    throw new Error(data?.error || `activate-sale ${action} failed ${res.status}`);
+    // The server's `error` may be a structured object; stringify it so the
+    // thrown Error message never collapses to "[object Object]".
+    const serverErr =
+      typeof data?.error === 'string'
+        ? data.error
+        : data?.error != null
+          ? JSON.stringify(data.error)
+          : '';
+    throw new Error(serverErr || `activate-sale ${action} failed ${res.status}`);
   }
   return data;
+}
+
+// Safe error-to-string: never produces "[object Object]" in the activity log.
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : JSON.stringify(err);
 }
 
 // ─── Group presentation metadata ──────────────────────────────
@@ -133,7 +146,7 @@ const DiscountManager: React.FC = () => {
       }
     } catch (err: any) {
       console.error('[DiscountManager] hydrate failed:', err);
-      addLog(`Refresh failed (${err?.message}). Using static catalogue fallback.`, 'warn');
+      addLog(`Refresh failed (${errMsg(err)}). Using static catalogue fallback.`, 'warn');
       // Fall back to the pre-seeded static catalogue.
       if (!state.catalogueLastUpdated) {
         setState({
@@ -215,7 +228,7 @@ const DiscountManager: React.FC = () => {
       }
     } catch (err: any) {
       console.error('[DiscountManager] activate failed:', err);
-      addLog(`Activate Group ${meta.letter} failed: ${err?.message}`, 'error');
+      addLog(`Activate Group ${meta.letter} failed: ${errMsg(err)}`, 'error');
     } finally {
       setBusy(null);
     }
@@ -240,13 +253,13 @@ const DiscountManager: React.FC = () => {
         return { activeSales: next };
       });
       addLog(
-        `Group ${meta.letter} reverted — Shopify (${s.reverted ?? 0}/${s.total ?? items.length}) + ` +
-        `Walmart ${w.submitted ? 'BASE feed resubmitted' : 'feed skipped'}.`,
+        `Group ${meta.letter} reverted — Shopify ${s.reverted ?? 0}/${s.total ?? items.length} · ` +
+        `Walmart ${w.submitted ? `${w.updated ?? 0} restored` : `skipped${w.error ? ` (${w.error})` : ''}`}.`,
         'success',
       );
     } catch (err: any) {
       console.error('[DiscountManager] revert failed:', err);
-      addLog(`Revert Group ${meta.letter} failed: ${err?.message}`, 'error');
+      addLog(`Revert Group ${meta.letter} failed: ${errMsg(err)}`, 'error');
     } finally {
       if (!silentBusy) setBusy(null);
     }
@@ -281,7 +294,7 @@ const DiscountManager: React.FC = () => {
           'success',
         );
       } catch (err: any) {
-        addLog(`Failed to submit ${item.sku}: ${err?.message}`, 'error');
+        addLog(`Failed to submit ${item.sku}: ${errMsg(err)}`, 'error');
       }
     }
   }
