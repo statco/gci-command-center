@@ -1,11 +1,12 @@
 // api/refresh-catalogue.ts
 // ─────────────────────────────────────────────────────────────
 // Rebuilds the Discount Manager sale groups from LIVE Shopify data.
-// Shopify is the source of truth — only ACTIVE products with TIRE-
-// prefixed SKUs are included. Each item carries a pre-resolved
-// shopifyVariantId so activate-sale.ts can skip per-SKU lookups.
+// Shopify is the source of truth. Products are included when:
+//   product.status === ACTIVE  AND  product.productType contains "Tire"
+// Each item carries a pre-resolved shopifyVariantId so
+// activate-sale.ts can skip per-SKU GraphQL lookups.
 //
-//   - Fetch all Shopify variants (paginated GraphQL), filter TIRE- + ACTIVE
+//   - Paginated GraphQL fetch, filter ACTIVE + productType:Tire
 //   - Price breaks: LOW ≤ $260 | MID $261–$349 | HIGH ≥ $350
 //   - Sample 100 per group
 //   - New-item detection vs stored KV catalogue
@@ -223,25 +224,32 @@ function classify(price: number): GroupId {
   return 'high';
 }
 
-// ─── Fetch all TIRE- variants from Shopify ───────────────────
+// ─── Fetch all active tire variants from Shopify ─────────────
+// Uses the `products` query with `status:active product_type:Tire`
+// so Shopify does the filtering server-side. Each product's
+// variants are expanded inline (max 100 variants per product).
 async function fetchAllShopifyTireVariants(): Promise<CatalogueItem[]> {
   if (!SHOPIFY_TOKEN) throw new Error('SHOPIFY_ADMIN_API_TOKEN not set');
 
   const items: CatalogueItem[] = [];
   let cursor: string | null = null;
   let page = 0;
-  const MAX_PAGES = 200; // 200 × 250 = 50k variants safety cap
+  const MAX_PAGES = 200;
 
   while (page < MAX_PAGES) {
     const data: any = await shopifyGraphQL<any>(
-      `query TireVariants($cursor: String) {
-         productVariants(first: 250, after: $cursor) {
+      `query ActiveTires($cursor: String) {
+         products(first: 50, after: $cursor, query: "status:active product_type:Tire") {
            edges {
              node {
                id
-               sku
-               price
-               product { id title status }
+               title
+               productType
+               variants(first: 100) {
+                 edges {
+                   node { id sku price }
+                 }
+               }
              }
            }
            pageInfo { hasNextPage endCursor }
@@ -250,26 +258,28 @@ async function fetchAllShopifyTireVariants(): Promise<CatalogueItem[]> {
       { cursor },
     );
 
-    const conn = data?.productVariants;
-    for (const edge of conn?.edges || []) {
-      const node = edge?.node;
-      if (!node) continue;
-      const sku = (node.sku || '').trim();
-      if (!sku.toUpperCase().startsWith('TIRE-')) continue;
-      if (node.product?.status && node.product.status !== 'ACTIVE') continue;
-
-      const price = parseFloat(node.price) || 0;
-      items.push({
-        id: sku,
-        sku,
-        offerId: sku,
-        gtin: '',
-        price,
-        title: node.product?.title || sku,
-        group: classify(price),
-        shopifyProductId: node.product?.id || undefined,
-        shopifyVariantId: gidToId(node.id) || undefined,
-      });
+    const conn = data?.products;
+    for (const prodEdge of conn?.edges || []) {
+      const product = prodEdge?.node;
+      if (!product) continue;
+      for (const varEdge of product.variants?.edges || []) {
+        const v = varEdge?.node;
+        if (!v) continue;
+        const sku = (v.sku || '').trim();
+        if (!sku) continue;
+        const price = parseFloat(v.price) || 0;
+        items.push({
+          id: sku,
+          sku,
+          offerId: sku,
+          gtin: '',
+          price,
+          title: product.title || sku,
+          group: classify(price),
+          shopifyProductId: product.id || undefined,
+          shopifyVariantId: gidToId(v.id) || undefined,
+        });
+      }
     }
 
     page++;
@@ -278,7 +288,7 @@ async function fetchAllShopifyTireVariants(): Promise<CatalogueItem[]> {
     await delay(SHOPIFY_PAGE_DELAY_MS);
   }
 
-  console.log(`[refresh-catalogue] Shopify fetch: ${items.length} TIRE- variants across ${page} page(s)`);
+  console.log(`[refresh-catalogue] Shopify fetch: ${items.length} active tire variants across ${page} page(s)`);
   return items;
 }
 

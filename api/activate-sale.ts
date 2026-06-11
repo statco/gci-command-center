@@ -144,8 +144,8 @@ function shopifyHeaders(): Record<string, string> {
   };
 }
 
-function isTireSku(sku: string): boolean {
-  return typeof sku === 'string' && sku.toUpperCase().startsWith('TIRE-');
+function isValidSku(sku: string): boolean {
+  return typeof sku === 'string' && sku.trim().length > 0;
 }
 
 // Shopify Admin GraphQL POST. The REST endpoint /variants.json does NOT support
@@ -407,10 +407,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     : Array.isArray(body.skus)
       ? body.skus.map((s: string) => ({ sku: s }))
       : [];
-  const items = rawItems.filter(i => i && isTireSku(i.sku));
+  const items = rawItems.filter(i => i && isValidSku(i.sku));
 
   if (items.length === 0) {
-    return res.status(400).json({ error: 'No TIRE- SKUs provided', code: 400 });
+    return res.status(400).json({ error: 'No valid SKUs provided', code: 400 });
   }
 
   // Startup diagnostic — confirms which env is wired up without leaking secrets.

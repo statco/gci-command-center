@@ -1,10 +1,11 @@
 // src/pages/DiscountManager/catalogue.ts
 // ─────────────────────────────────────────────────────────────
 // Pre-seeded STATIC catalogue used as a fallback when the live
-// Walmart refresh (GET /api/refresh-catalogue) is unavailable.
+// refresh (GET /api/refresh-catalogue) is unavailable.
 //
-// 100 placeholder items per sale group, all using the TIRE- SKU
-// prefix. Price ranges mirror the analysis of GCI_Full_catalogue.xlsx:
+// 100 placeholder items per sale group. SKUs mirror the real
+// Shopify store format (numeric, AP*, M* prefixes).
+// Price ranges mirror the analysis of GCI_Full_catalogue.xlsx:
 //
 //   LOW  group: avg $215, range $149.99–$259.99   (≤ $260)
 //   MID  group: avg $289, range $261.99–$344.99   ($261–$349)
@@ -16,13 +17,13 @@
 
 export interface CatalogueItem {
   id: string;
-  sku: string;               // TIRE-XXXXXX
-  offerId: string;           // legacy Walmart offerId (= sku for Shopify-sourced items)
+  sku: string;               // Shopify variant SKU (various formats)
+  offerId: string;           // = sku (kept for interface compat)
   gtin: string;
-  price: number;             // current price (CAD)
+  price: number;             // current Shopify price (CAD)
   title: string;
   group: 'low' | 'mid' | 'high';
-  shopifyProductId?: string; // gid://shopify/Product/…
+  shopifyProductId?: string; // gid://shopify/Product/...
   shopifyVariantId?: number; // numeric Shopify variant ID (pre-resolved)
   addedAt?: string;          // ISO — set when auto-added by cron
   autoAdded?: boolean;       // true if added by nightly refresh
@@ -50,6 +51,7 @@ const SIZES = [
   '205/55R16', '225/45R17', '235/65R18', '215/60R16', '245/40R18',
   '265/70R17', '195/65R15', '255/35R19', '275/55R20', '225/65R17',
 ];
+const SKU_PREFIXES = ['MV', 'MB', 'MW', 'AP', ''];
 
 function priceEndingIn99(rng: () => number, min: number, max: number): number {
   const whole = Math.floor(min + rng() * (max - min));
@@ -69,14 +71,14 @@ function buildGroup(
     const brand = BRANDS[Math.floor(rng() * BRANDS.length)];
     const season = SEASONS[Math.floor(rng() * SEASONS.length)];
     const size = SIZES[Math.floor(rng() * SIZES.length)];
-    // 6-digit SKU suffix, namespaced per group so they never collide.
+    const prefix = SKU_PREFIXES[Math.floor(rng() * SKU_PREFIXES.length)];
     const suffix = String(seed + i).padStart(6, '0').slice(-6);
-    const sku = `TIRE-${suffix}`;
+    const sku = `${prefix}${suffix}`;
     items.push({
       id: `${group}-${i}`,
       sku,
-      offerId: `WMOFFER-${suffix}`,
-      gtin: `0062${suffix}${String((seed + i) % 10000).padStart(4, '0')}`.slice(0, 14),
+      offerId: sku,
+      gtin: '',
       price: priceEndingIn99(rng, minPrice, maxPrice),
       title: `${brand} ${season} ${size}`,
       group,

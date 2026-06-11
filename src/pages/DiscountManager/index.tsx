@@ -497,7 +497,7 @@ const DiscountManager: React.FC = () => {
               {state.pendingApprovals.length}
             </span>
           </h2>
-          <p className="text-xs text-gray-400 mb-3">New TIRE- items flagged by the nightly cron (price &gt; ${state.autoAddCeiling}). Approve to add to a group.</p>
+          <p className="text-xs text-gray-400 mb-3">New tire items flagged by the nightly cron (price &gt; ${state.autoAddCeiling}). Approve to add to a group.</p>
           <div className="space-y-2">
             {state.pendingApprovals.map(item => (
               <div key={item.sku} className="flex items-center justify-between bg-gray-50 rounded-lg px-3 py-2">
