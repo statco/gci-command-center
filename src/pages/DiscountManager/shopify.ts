@@ -6,7 +6,6 @@
 //   - X-Shopify-Access-Token header
 //   - API version 2024-01
 //
-// All functions only operate on SKUs starting with "TIRE-".
 // A 250ms delay is enforced between variant writes to stay within
 // Shopify's Basic plan rate limit (2 req/s).
 // ─────────────────────────────────────────────────────────────
@@ -15,8 +14,6 @@ const SHOPIFY_DOMAIN =
   process.env.SHOPIFY_STORE_DOMAIN || 'gcitires-ca.myshopify.com';
 const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_API_TOKEN || '';
 const API_VERSION = '2024-01';
-
-const TIRE_PREFIX = 'TIRE-';
 
 export interface ShopifyVariant {
   id: number;
@@ -27,10 +24,6 @@ export interface ShopifyVariant {
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function isTireSku(sku: string): boolean {
-  return typeof sku === 'string' && sku.toUpperCase().startsWith(TIRE_PREFIX);
 }
 
 function baseUrl(): string {
@@ -46,13 +39,10 @@ function headers(): Record<string, string> {
 
 /**
  * Look up a variant by SKU. Returns the variant with its current price and
- * compare_at_price, or null when no TIRE- variant matches.
+ * compare_at_price, or null when no variant matches.
  */
 export async function getVariantBySku(sku: string): Promise<ShopifyVariant | null> {
-  if (!isTireSku(sku)) {
-    console.warn(`[shopify] getVariantBySku: skipping non-TIRE sku ${sku}`);
-    return null;
-  }
+  if (!sku || typeof sku !== 'string') return null;
 
   const res = await fetch(
     `${baseUrl()}/variants.json?sku=${encodeURIComponent(sku)}&limit=1`,
@@ -67,7 +57,7 @@ export async function getVariantBySku(sku: string): Promise<ShopifyVariant | nul
 
 /**
  * Apply a sale price: set price = discounted, compare_at_price = original
- * (the strikethrough "was" price). Only writes TIRE- variants.
+ * (the strikethrough "was" price).
  */
 export async function applyCompareAtDiscount(
   variantId: number | string,
