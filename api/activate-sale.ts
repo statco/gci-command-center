@@ -418,7 +418,18 @@ async function handleActivate(
         skipped++; continue;
       }
       console.log(`[activate-sale] ${item.sku}: variant ${variant.id} price=${variant.price} compareAt=${variant.compare_at_price ?? 'null'}`);
-      const originalPrice = parseFloat(variant.price) || item.price || 0;
+      // Compounding-discount safeguard: if compare_at_price is already set, this
+      // variant is already on sale (someone activated without reverting). Use
+      // the stashed compare_at_price as the true original so we don't discount a
+      // price that's already discounted.
+      const compareAt = parseFloat(variant.compare_at_price || '');
+      const alreadyDiscounted = Number.isFinite(compareAt) && compareAt > 0;
+      const originalPrice = alreadyDiscounted
+        ? compareAt
+        : parseFloat(variant.price) || item.price || 0;
+      if (alreadyDiscounted) {
+        console.log(`[activate-sale] ${item.sku}: compare_at_price already set ($${compareAt}) — using it as original to avoid compounding`);
+      }
       if (!dry) {
         await putVariant(variant.id, {
           price: round2(originalPrice * (1 - pct / 100)).toFixed(2),
