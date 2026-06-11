@@ -256,7 +256,10 @@ async function fetchAllShopifyTireVariants(): Promise<CatalogueItem[]> {
       if (!node) continue;
       const sku = (node.sku || '').trim();
       if (!sku.toUpperCase().startsWith('TIRE-')) continue;
-      if (node.product?.status && node.product.status !== 'ACTIVE') continue;
+      // No product-status filter: many TIRE- products are DRAFT on Shopify
+      // (imported but not storefront-published). Variant prices can still be
+      // updated via Admin API regardless of status — activate-sale.ts proved
+      // this by resolving 99/100 variants without any status check.
 
       const price = parseFloat(node.price) || 0;
       items.push({
