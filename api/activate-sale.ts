@@ -35,6 +35,9 @@ const SHOPIFY_DOMAIN = process.env.SHOPIFY_STORE_DOMAIN || 'gcitires-ca.myshopif
 const SHOPIFY_TOKEN = process.env.SHOPIFY_ADMIN_API_TOKEN || '';
 const SHOPIFY_API_VERSION = '2024-01';
 
+const KV_URL = process.env.KV_REST_API_URL || '';
+const KV_TOKEN = process.env.KV_REST_API_TOKEN || '';
+
 const PROXY_SECRET = process.env.PROXY_SECRET || '';
 const SHOPIFY_RATE_DELAY_MS = 250; // Shopify Basic ≈ 2 req/s
 const WALMART_RATE_DELAY_MS = 150; // gentle spacing between per-SKU price PUTs
@@ -63,6 +66,63 @@ interface ShopifyVariant {
   sku: string;
   price: string;
   compare_at_price: string | null;
+}
+
+// Snapshot persisted to KV on activation so revert can restore the true
+// original prices regardless of the variants' current compare_at_price.
+interface StoredActiveSale {
+  group: GroupTier;
+  pct: number;
+  activatedAt: string;
+  items: CollectedItem[];
+}
+
+const activeSaleKey = (group: GroupTier) => `active_sale:${group}`;
+
+// ─── Vercel KV (REST, Upstash-compatible) ─────────────────────
+async function kvGet<T>(key: string): Promise<T | null> {
+  if (!KV_URL || !KV_TOKEN) return null;
+  try {
+    const res = await fetch(`${KV_URL}/get/${encodeURIComponent(key)}`, {
+      headers: { Authorization: `Bearer ${KV_TOKEN}` },
+    });
+    if (!res.ok) return null;
+    const data: any = await res.json();
+    if (data?.result == null) return null;
+    return JSON.parse(data.result) as T;
+  } catch (err) {
+    console.error('[activate-sale] kvGet failed:', err);
+    return null;
+  }
+}
+
+async function kvSet(key: string, value: unknown): Promise<boolean> {
+  if (!KV_URL || !KV_TOKEN) return false;
+  try {
+    const res = await fetch(`${KV_URL}/set/${encodeURIComponent(key)}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${KV_TOKEN}`, 'Content-Type': 'text/plain' },
+      body: JSON.stringify(value),
+    });
+    return res.ok;
+  } catch (err) {
+    console.error('[activate-sale] kvSet failed:', err);
+    return false;
+  }
+}
+
+async function kvDel(key: string): Promise<boolean> {
+  if (!KV_URL || !KV_TOKEN) return false;
+  try {
+    const res = await fetch(`${KV_URL}/del/${encodeURIComponent(key)}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${KV_TOKEN}` },
+    });
+    return res.ok;
+  } catch (err) {
+    console.error('[activate-sale] kvDel failed:', err);
+    return false;
+  }
 }
 
 // ─── Walmart auth (module-scoped token cache) ─────────────────
@@ -428,7 +488,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   try {
     if (action === 'revert') {
-      return await handleRevert(req, res, items, dry);
+      return await handleRevert(req, res, body, items, dry);
     }
     return await handleActivate(req, res, body, items, dry);
   } catch (err: any) {
@@ -488,6 +548,29 @@ async function handleActivate(
 
   const shopify = { updated: collected.length, skipped, total: items.length, failed };
 
+  // Step 3: persist the activated snapshot to KV. Revert reads this to restore
+  // the true original prices, so it no longer depends on compare_at_price still
+  // being set on each variant. Stored even if Walmart later fails — Shopify is
+  // the side that needs a reliable revert.
+  //
+  // Merge with any existing snapshot rather than overwrite: single-item
+  // approve-and-add (approveItem) activates one SKU at a time and must not wipe
+  // the rest of the group's snapshot. New entries for a SKU replace older ones.
+  if (!dry && collected.length > 0) {
+    const existing = await kvGet<StoredActiveSale>(activeSaleKey(group));
+    const mergedBySku = new Map<string, CollectedItem>();
+    for (const it of existing?.items || []) mergedBySku.set(it.sku, it);
+    for (const it of collected) mergedBySku.set(it.sku, it);
+    const snapshot: StoredActiveSale = {
+      group,
+      pct,
+      activatedAt: existing?.activatedAt || new Date().toISOString(),
+      items: [...mergedBySku.values()],
+    };
+    const ok = await kvSet(activeSaleKey(group), snapshot);
+    console.log(`[activate-sale] snapshot ${activeSaleKey(group)}: ${ok ? 'saved' : 'FAILED to save'} (${collected.length} new, ${snapshot.items.length} total)`);
+  }
+
   // Step 4: only submit to Walmart if Shopify succeeded on ≥1 variant.
   let walmart: any = { submitted: false, reason: 'no Shopify variants updated' };
   if (collected.length > 0) {
@@ -524,63 +607,108 @@ async function handleActivate(
 async function handleRevert(
   _req: VercelRequest,
   res: VercelResponse,
+  body: any,
   items: IncomingItem[],
   dry: boolean,
 ) {
+  const group: GroupTier = (body.group as GroupTier) || items[0]?.group || 'low';
+
+  // Load the activation snapshot — the authoritative record of what was
+  // discounted and each variant's true original price. This is what makes
+  // revert reliable: we no longer depend on compare_at_price still being set.
+  const stored = await kvGet<StoredActiveSale>(activeSaleKey(group));
+  if (stored?.items?.length) {
+    console.log(`[activate-sale] revert ${group}: loaded snapshot from ${activeSaleKey(group)} (${stored.items.length} items, activated ${stored.activatedAt})`);
+  } else {
+    console.log(`[activate-sale] revert ${group}: no KV snapshot — falling back to compare_at_price lookup`);
+  }
+
+  // Build a per-SKU plan. Incoming request items are the fallback; the stored
+  // snapshot (when present) overlays the authoritative variantId + original
+  // price. The union covers every SKU either side knows about.
+  type RevertPlan = { sku: string; variantId?: number; originalPrice: number; fromSnapshot: boolean };
+  const planBySku = new Map<string, RevertPlan>();
+  for (const it of items) {
+    planBySku.set(it.sku, {
+      sku: it.sku,
+      variantId: it.shopifyVariantId,
+      originalPrice: it.price || 0,
+      fromSnapshot: false,
+    });
+  }
+  for (const it of stored?.items || []) {
+    const variantId = typeof it.variantId === 'number' ? it.variantId : parseInt(String(it.variantId), 10);
+    planBySku.set(it.sku, {
+      sku: it.sku,
+      variantId: Number.isFinite(variantId) ? variantId : undefined,
+      originalPrice: it.originalPrice || 0,
+      fromSnapshot: true,
+    });
+  }
+
+  const plans = [...planBySku.values()];
   const collected: CollectedItem[] = [];          // Shopify variants actually reverted
   const walmartItems: CollectedItem[] = [];        // every SKU to restore on Walmart
   const failed: { sku: string; error: string }[] = [];
   let skipped = 0;
 
-  for (const item of items) {
-    // Best-known original price: the catalogue price from the request is the
-    // fallback so Walmart can still be restored even if the Shopify lookup
-    // fails or the variant is gone.
-    let originalPrice = item.price || 0;
-    let variantId: number | string | null = null;
+  for (const plan of plans) {
+    let originalPrice = plan.originalPrice || 0;
+    let variantId: number | string | null = plan.variantId ?? null;
 
     try {
-      const variant = item.shopifyVariantId
-        ? await getVariantById(item.shopifyVariantId)
-        : await getVariantBySku(item.sku);
-      if (!variant) {
-        console.log(`[activate-sale] revert ${item.sku}: no variant — Shopify skip (Walmart will still restore $${originalPrice || '?'})`);
-        skipped++;
-      } else {
-        // Original price is whatever we previously stashed in compare_at_price;
-        // fall back to the live price, then the request price.
-        const stashed = parseFloat(variant.compare_at_price || '');
-        originalPrice = (Number.isFinite(stashed) && stashed > 0)
-          ? stashed
-          : (parseFloat(variant.price) || item.price || 0);
-        variantId = variant.id;
-        console.log(`[activate-sale] revert ${item.sku}: found variant ${variant.id}, restoring $${originalPrice} (compareAt=${variant.compare_at_price ?? 'null'})`);
+      // Snapshot path: we already trust the original price and variant ID, so
+      // restore directly without a lookup. This is the reliable case.
+      if (plan.fromSnapshot && plan.variantId && originalPrice > 0) {
+        console.log(`[activate-sale] revert ${plan.sku}: snapshot restore variant ${plan.variantId} → $${originalPrice}`);
         if (!dry) {
-          await putVariant(variant.id, { price: originalPrice.toFixed(2), compare_at_price: null });
+          await putVariant(plan.variantId, { price: originalPrice.toFixed(2), compare_at_price: null });
           await delay(SHOPIFY_RATE_DELAY_MS);
         }
-        collected.push({ sku: item.sku, variantId: variant.id, originalPrice });
+        collected.push({ sku: plan.sku, variantId: plan.variantId, originalPrice });
+      } else {
+        // Legacy path (no snapshot for this SKU): look the variant up and use
+        // compare_at_price as the original, falling back to live/request price.
+        const variant = plan.variantId
+          ? await getVariantById(plan.variantId)
+          : await getVariantBySku(plan.sku);
+        if (!variant) {
+          console.log(`[activate-sale] revert ${plan.sku}: no variant — Shopify skip (Walmart will still restore $${originalPrice || '?'})`);
+          skipped++;
+        } else {
+          const stashed = parseFloat(variant.compare_at_price || '');
+          originalPrice = (Number.isFinite(stashed) && stashed > 0)
+            ? stashed
+            : (originalPrice || parseFloat(variant.price) || 0);
+          variantId = variant.id;
+          console.log(`[activate-sale] revert ${plan.sku}: lookup restore variant ${variant.id} → $${originalPrice} (compareAt=${variant.compare_at_price ?? 'null'})`);
+          if (!dry) {
+            await putVariant(variant.id, { price: originalPrice.toFixed(2), compare_at_price: null });
+            await delay(SHOPIFY_RATE_DELAY_MS);
+          }
+          collected.push({ sku: plan.sku, variantId: variant.id, originalPrice });
+        }
       }
     } catch (e: any) {
       const msg = e?.message || String(e);
-      console.error(`[activate-sale] revert ${item.sku}: error — ${msg}`);
-      failed.push({ sku: item.sku, error: msg });
+      console.error(`[activate-sale] revert ${plan.sku}: error — ${msg}`);
+      failed.push({ sku: plan.sku, error: msg });
     }
 
-    // BUG 3: always queue for Walmart restore regardless of the Shopify outcome,
-    // as long as we have a usable original price.
+    // Always queue for Walmart restore regardless of the Shopify outcome, as
+    // long as we have a usable original price.
     if (originalPrice > 0) {
-      walmartItems.push({ sku: item.sku, variantId: variantId ?? item.sku, originalPrice });
+      walmartItems.push({ sku: plan.sku, variantId: variantId ?? plan.sku, originalPrice });
     } else {
-      console.log(`[activate-sale] revert ${item.sku}: no usable original price — cannot restore on Walmart`);
+      console.log(`[activate-sale] revert ${plan.sku}: no usable original price — cannot restore on Walmart`);
     }
   }
 
-  const shopify = { reverted: collected.length, skipped, total: items.length, failed };
-  console.log(`[activate-sale] revert summary: Shopify reverted ${collected.length}/${items.length} (skipped ${skipped}, failed ${failed.length}); Walmart restore queued ${walmartItems.length}`);
+  const shopify = { reverted: collected.length, skipped, total: plans.length, failed };
+  console.log(`[activate-sale] revert summary: Shopify reverted ${collected.length}/${plans.length} (skipped ${skipped}, failed ${failed.length}); Walmart restore queued ${walmartItems.length}`);
 
-  // BUG 3: Walmart restore is no longer gated on Shopify reverting ≥1 variant —
-  // always push the original prices back for every SKU in the group.
+  // Walmart restore is not gated on Shopify reverting ≥1 variant — always push
+  // the original prices back for every SKU in the group.
   let walmart: any = { submitted: false, reason: 'no SKUs with a usable original price' };
   if (dry) {
     walmart = { submitted: false, dry: true, wouldSubmit: walmartItems.length };
@@ -599,5 +727,24 @@ async function handleRevert(
     }
   }
 
-  return res.status(200).json({ success: true, action: 'revert', dry, shopify, walmart });
+  // Clear the activation snapshot once revert is done. Only delete when nothing
+  // failed, so a partial revert can be safely retried against the same snapshot.
+  if (!dry && stored && failed.length === 0) {
+    const ok = await kvDel(activeSaleKey(group));
+    console.log(`[activate-sale] snapshot ${activeSaleKey(group)}: ${ok ? 'cleared' : 'FAILED to clear'} after revert`);
+  } else if (!dry && stored && failed.length > 0) {
+    console.log(`[activate-sale] snapshot ${activeSaleKey(group)}: kept (${failed.length} Shopify failures — retry revert to finish)`);
+  }
+
+  return res.status(200).json({
+    success: true,
+    action: 'revert',
+    group,
+    dry,
+    shopify,
+    walmart,
+    snapshot: stored
+      ? { found: true, items: stored.items.length, activatedAt: stored.activatedAt, cleared: !dry && failed.length === 0 }
+      : { found: false },
+  });
 }
