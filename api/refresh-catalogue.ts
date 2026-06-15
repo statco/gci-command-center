@@ -333,6 +333,76 @@ async function submitItemToActivePromo(
   }
 }
 
+const WALMART_RATE_DELAY_MS = 150;
+
+// ─── Walmart BASE price sync ──────────────────────────────────
+// After rebuilding the catalogue from Shopify, push every active SKU's
+// current Shopify price to Walmart as currentPriceType: "BASE". This
+// keeps Walmart's regular listed price in sync with Shopify so that:
+//   1. Walmart shows the correct price even when no promo is running.
+//   2. The REDUCED/CLEARANCE comparisonPrice in activate-sale.ts is
+//      always grounded in the real Shopify price, not a stale Walmart value.
+//
+// Runs on every non-dry cron execution. ~300 SKUs × 150ms ≈ 45s — well
+// within Vercel's 300s function timeout.
+async function syncWalmartBasePrices(
+  items: CatalogueItem[],
+): Promise<{ updated: number; failed: number; failures: { sku: string; status: number; error: string }[] }> {
+  if (items.length === 0) return { updated: 0, failed: 0, failures: [] };
+
+  const token = await getWalmartToken();
+  let updated = 0;
+  let failed = 0;
+  const failures: { sku: string; status: number; error: string }[] = [];
+
+  for (const item of items) {
+    if (!item.sku || !item.price || item.price <= 0) continue;
+
+    const res = await fetch(`${WALMART_BASE}/v3/price`, {
+      method: 'PUT',
+      headers: walmartHeaders(token),
+      body: JSON.stringify({
+        sku: item.sku,
+        pricing: [{
+          currentPriceType: 'BASE',
+          currentPrice: { currency: 'CAD', amount: item.price },
+        }],
+      }),
+    });
+
+    if (res.status === 429) {
+      await delay(2000);
+      const retry = await fetch(`${WALMART_BASE}/v3/price`, {
+        method: 'PUT',
+        headers: walmartHeaders(token),
+        body: JSON.stringify({
+          sku: item.sku,
+          pricing: [{
+            currentPriceType: 'BASE',
+            currentPrice: { currency: 'CAD', amount: item.price },
+          }],
+        }),
+      });
+      if (retry.ok) { updated++; } else {
+        failed++;
+        failures.push({ sku: item.sku, status: retry.status, error: (await retry.text()).slice(0, 200) });
+      }
+    } else if (res.ok) {
+      updated++;
+    } else {
+      failed++;
+      const text = await res.text();
+      failures.push({ sku: item.sku, status: res.status, error: text.slice(0, 200) });
+      console.error(`[refresh-catalogue] BASE sync ✗ ${item.sku} ${res.status}: ${text.slice(0, 200)}`);
+    }
+
+    await delay(WALMART_RATE_DELAY_MS);
+  }
+
+  console.log(`[refresh-catalogue] Walmart BASE sync: ${updated} updated, ${failed} failed of ${items.length} SKUs`);
+  return { updated, failed, failures };
+}
+
 // ─── Handler ─────────────────────────────────────────────────
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   const force = req.query.force === 'true';
@@ -413,9 +483,25 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       activeSales: prev?.activeSales,
     };
 
+    let baseSync: { updated: number; failed: number; failures: { sku: string; status: number; error: string }[] } | null = null;
+
     // ── Persist + notify (skipped on dry) ───────────────────
     if (!dry) {
       await kvSet(KV_KEY, stored);
+
+      // ── Sync all active SKU base prices to Walmart ─────────
+      // Keeps Walmart's regular price in sync with Shopify so the
+      // correct price displays whether a promo is running or not.
+      const allGroupItems: CatalogueItem[] = [
+        ...(groups.low  || []),
+        ...(groups.mid  || []),
+        ...(groups.high || []),
+      ];
+      baseSync = await syncWalmartBasePrices(allGroupItems);
+      console.log(
+        `[refresh-catalogue] BASE price sync complete: ` +
+        `${baseSync.updated}/${allGroupItems.length} updated, ${baseSync.failed} failed`,
+      );
 
       for (const g of ['low', 'mid', 'high'] as GroupId[]) {
         const skus = autoAddedByGroup[g];
@@ -443,6 +529,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       newItems,
       skipped: false,
       dry,
+      walmartBaseSync: baseSync,
     });
   } catch (err: any) {
     console.error('[refresh-catalogue] error:', err);
