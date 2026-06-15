@@ -98,6 +98,7 @@ const DiscountManager: React.FC = () => {
   const { state, setState, addLog } = useDiscountStore();
   const [busy, setBusy] = useState<GroupId | 'refresh' | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [syncingWalmart, setSyncingWalmart] = useState(false);
 
   const liveGroups = useMemo(
     () => GROUP_ORDER.filter(g => !!state.activeSales[g]),
@@ -299,6 +300,32 @@ const DiscountManager: React.FC = () => {
     }
   }
 
+  // ── Sync Walmart base prices to current Shopify prices ──────
+  async function syncWalmartBasePrices() {
+    setSyncingWalmart(true);
+    addLog('Syncing Walmart base prices to current Shopify prices…', 'info');
+    try {
+      const res = await fetch('/api/sync-walmart-base-prices', { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const msg = typeof data?.error === 'string'
+          ? data.error
+          : data?.error != null ? JSON.stringify(data.error) : `HTTP ${res.status}`;
+        throw new Error(msg);
+      }
+      const durationSec = data.durationMs ? `${(data.durationMs / 1000).toFixed(1)}s` : '';
+      addLog(
+        `Walmart base prices synced: ${data.updated ?? 0} updated, ` +
+        `${data.failed ?? 0} failed of ${data.total ?? 0} SKUs${durationSec ? ` (${durationSec})` : ''}.`,
+        data.failed > 0 ? 'warn' : 'success',
+      );
+    } catch (err) {
+      addLog(`Walmart base price sync failed: ${errMsg(err)}`, 'error');
+    } finally {
+      setSyncingWalmart(false);
+    }
+  }
+
   function dismissItem(item: CatalogueItem) {
     setState(prev => ({ pendingApprovals: prev.pendingApprovals.filter(i => i.sku !== item.sku) }));
     addLog(`Dismissed pending item ${item.sku}.`, 'info');
@@ -323,6 +350,14 @@ const DiscountManager: React.FC = () => {
               className="px-3 py-2 text-sm font-medium rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50"
             >
               {busy === 'refresh' ? 'Refreshing…' : '↻ Refresh Catalogue'}
+            </button>
+            <button
+              onClick={syncWalmartBasePrices}
+              disabled={syncingWalmart}
+              title="Push current Shopify prices to Walmart as base prices. Run after any price update or CT sync."
+              className="px-3 py-2 text-sm font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"
+            >
+              {syncingWalmart ? 'Syncing…' : '⇅ Sync Walmart Prices'}
             </button>
             <button
               onClick={() => setShowSettings(s => !s)}
