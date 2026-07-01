@@ -5,7 +5,8 @@
 > identically across all 6 repos below so it's available no matter which one you
 > land in first. If you update it, update all 6 copies.
 >
-> Last written: 2026-07-01, following a full cross-repo audit. Status markers:
+> Last written: 2026-07-01, last updated: 2026-07-02, following a full
+> cross-repo audit and remediation pass. Status markers:
 > ✅ verified working · 🟡 built but not fully live-verified · ⛔ known broken/blocked ·
 > 🔲 not yet built.
 
@@ -34,11 +35,11 @@ actual current purpose (some don't; see §4).
 | Repo | Role | Deploys to | Status |
 |---|---|---|---|
 | **gci-brain** | Shopify catalog/SEO/marketing engine. Owns: CT→Shopify catalog sync (`shopifySync.ts`), GMC/Microsoft Merchant feeds, SEO backfill, social media scheduler, blog publisher, installer booking UI (AI Match), `/api/airtable` + `/api/send-email` proxies used by other repos. | `gci-brain.vercel.app`, custom domain `match.gcitires.com` | ✅ core catalog/SEO pipeline working. ⛔ GMC account suspended (business action needed, not code). See §5. |
-| **gci-order-hub** | Order automation for GCI's own Shopify store: Shopify `orders/paid` webhook → routes to CT (TIRE- SKUs) or CJ Dropshipping (NUPROZ- SKUs, **now dead — see §4**) → installer dispatch → Walmart price/inventory cron sync (`/api/walmart-sync`, `/api/walmart-sync-cursor`, `/api/walmart-ship`, etc. — more routes live than the README documents, check the actual `api/` folder). | `gci-order-hub.vercel.app` | ✅ core routing working. 🟡 CT auto-PO switch built, dormant (§6). |
+| **gci-order-hub** | Order automation for GCI's own Shopify store: Shopify `orders/paid` webhook → routes to CT (TIRE- SKUs) → installer dispatch → Walmart price/inventory cron sync (`/api/walmart-sync`, `/api/walmart-sync-cursor`, `/api/walmart-ship`, etc. — more routes live than the README documents, check the actual `api/` folder). CJ Dropshipping (NUPROZ- SKU) routing removed 2026-07 — see §3/§4. | `gci-order-hub.vercel.app` | ✅ core routing working. 🟡 CT auto-PO switch built, dormant (§6). |
 | **gci-command-center** | Internal ops dashboard — Sales/Marketing/Finance/IT/Content, one React app. Pulls Shopify + GA4 + Xero into one place. Also runs the Walmart discount-rotation system (`/promotions`). | **Two Vercel projects deploy the same repo** — `gci-command-center-ofzf` (custom domain `ops.gcitires.com`) is the real one; `gci-command-center` (plain `.vercel.app` URL) is a leftover duplicate slated for retirement. Don't be confused by there being two. | ✅ discount rotation working. ⛔ Xero integration token-expired, ⛔ GA4 integration permission-denied — both need manual re-auth, not code (§5). |
-| **gcitires-chatbot** | Customer-facing AI chat widget embedded on the storefront. Uses Airtable for customer memory/conversation history — **its own direct Airtable API key, NOT via gci-brain's proxy** (confirmed by reading `lib/airtable.ts`; a common misreading since it looks similar to the proxy pattern used elsewhere). | `gcitires-chatbot.vercel.app` | ✅ mostly working. ⛔ `/api/memory` times out regularly (15s limit, Airtable too slow for this — needs migration to a real DB, not yet done). |
+| **gcitires-chatbot** | Customer-facing AI chat widget embedded on the storefront. Memory/conversation history migrated 2026-07 from Airtable to Supabase (`chatbot_customers`/`chatbot_conversations` tables in the shared `gci-walmart-sync` Supabase project) — fixes the `/api/memory` timeout problem below. | `gcitires-chatbot.vercel.app` | 🟡 Code merged/PR open (gcitires-chatbot#27). Requires `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` env vars set + historical Airtable data migration script run before fully live — see §5. |
 | **gci-walmart-sync** | **Standalone commercial Shopify app** (Remix, Shopify App Store template) for Walmart CA Marketplace sync — listings, price, inventory, orders, returns. Built first for GCI, intended to be **published commercially** once ready. **Not activated for GCI's own operations yet** — pre-launch. | `app.gcitires.ca` (+ `gci-walmart-sync.vercel.app`) | 🟡 CC-1 through CC-12 built and compiling, feature-complete on paper, genuinely NOT live-tested with a real merchant yet (including GCI itself). See its own `docs/SESSION-CONTEXT.md` for full build history. |
-| **gci-price-monitor** | Daily competitor tire-price scraper (Python/Playwright), **runs via GitHub Actions, not Vercel** — despite having a `vercel.json`, that file is an unused stub. Reports via Telegram. | GitHub Actions cron (`.github/workflows/price_monitor.yml`, daily 8AM EST) | ✅ job runs successfully every day. ⛔ **architecturally can't produce useful trend data** — uses local SQLite that's wiped every run (fresh GitHub Actions container, nothing persisted). Needs a redesign with real persistent storage before the reports are worth anything. |
+| **gci-price-monitor** | Daily competitor tire-price scraper (Python/Playwright), **runs via GitHub Actions, not Vercel** — despite having a `vercel.json`, that file is an unused stub. Reports via Telegram. Persistence migrated 2026-07 from local SQLite to Supabase (`price_monitor_snapshots` table, same shared project) — real day-over-day trend data now possible for the first time. | GitHub Actions cron (`.github/workflows/price_monitor.yml`, daily 8AM EST) | 🟡 Migration PR open (gci-price-monitor#4), verified working end-to-end via a real `workflow_dispatch` test run against the branch (real scrape, real Supabase insert, confirmed via direct SQL query) before merge. `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` secrets already set on the repo. |
 
 **Explicitly not part of this system**, despite living in the same Vercel team:
 `nuprozone`, `gci-finance-website`, `gci-corporate-website` — unrelated projects,
@@ -53,11 +54,12 @@ don't touch without separately confirming scope.
 | **Shopify** (`gcitires-ca.myshopify.com`, plan: Basic) | All 6 repos, in different ways | Admin API token (`SHOPIFY_ADMIN_API_TOKEN` — watch for the older `SHOPIFY_ADMIN_TOKEN` name still lurking in some scripts, see gci-brain's project file) | **Basic plan** — no checkout extensibility / arbitrary custom-priced cart lines. Anything needing dynamic pricing (e.g. installation fees) has to use fixed-price product tiers, not true custom amounts. |
 | **Canada Tire (CT)** | gci-brain (catalog read), gci-order-hub (PO submission, dormant) | OAuth 1.0a (NetSuite RESTlet pattern) — Consumer Key/Secret, Token ID/Secret, Realm `8031691` | **Currently READ-ONLY** (`customscript_item_search_rl` — catalog/price search only). No order-creation endpoint exists yet. Credit line + API access reportedly coming — ask before assuming it's ready. |
 | **Walmart Canada Marketplace** | gci-order-hub (live), gci-command-center (live, discount rotation), gci-walmart-sync (built, not activated) | OAuth2 client_credentials, `WM_MARKET: ca` header, `WM_SEC.ACCESS_TOKEN` (not Bearer) | Multiple independent Walmart clients exist across repos — `gci-order-hub/api/lib/walmart-client.ts` is the oldest/most battle-tested; port patterns from there, don't reinvent. |
-| **Airtable** (`GCI Installer Portal` base) | gci-brain (owns the proxy at `/api/airtable`), gci-order-hub (calls gci-brain's proxy). **gcitires-chatbot uses its own separate, direct Airtable API key — not this proxy** (see §2 above, don't conflate the two when auditing exposure). | Server-side API key, proxied through gci-brain for gci-brain/gci-order-hub; chatbot has its own independent key | ⛔ **`/api/airtable` has no caller authentication and open CORS** — anyone who finds the endpoint can read Installer PII (bank info) or write fake records. Known issue, fix planned post-audit-report. Don't add more callers to this endpoint until it's locked down. Chatbot's separate key wasn't independently re-audited for the same class of issue in this pass. |
+| **Airtable** (`GCI Installer Portal` base) | gci-brain (owns `/api/nearby-installers` + `/api/submit-installer-application`, both narrow/safe; `/api/airtable` itself is now server-to-server only), gci-order-hub (calls `/api/airtable` with the shared secret). **gcitires-chatbot no longer uses Airtable at all as of 2026-07** — migrated to Supabase, see §2. | Server-side API key, held by gci-brain only | ✅ Fixed 2026-07 (gci-brain#129, gci-order-hub#44, merged). `/api/airtable` now requires `X-Internal-Secret` (env var `INTERNAL_API_SECRET`, must match across gci-brain + gci-order-hub) and is unreachable from any browser. The two browser-facing use cases (installer search, application submission) moved to purpose-built endpoints that never expose PII fields. |
 | **Xero** | gci-command-center (Finance page) | OAuth2, refresh token | ⛔ Refresh token expired/revoked as of audit date — needs manual re-auth via `/api/xero?resource=auth-url`. |
 | **GA4** | gci-command-center (Marketing page) | Service account | ⛔ 403 permission-denied on property `526079137` — service account needs to be re-added to the GA4 property access list in Google Analytics console. |
 | **Telegram + Resend** | gci-order-hub, gci-command-center, gci-price-monitor (Telegram only) | Bot token / API key per repo | Straightforward, no known issues. |
-| **CJ Dropshipping** | gci-order-hub (`NUPROZ-` SKU path) | API v2 | **Dead code as of 2026** — nuprozone.com was discontinued due to brand conflicts. The routing logic still exists and will fire if a `NUPROZ-` SKU ever appears; low risk but worth removing eventually. |
+| **Supabase** (project `gci-walmart-sync`, ref `enhbckomwdelktdhnuzq`, region `ca-central-1`) | gci-walmart-sync (original owner — `shops`/`products`/`walmart_orders`/`sync_logs`/`sessions`/`walmart_sync_cursor` tables), gcitires-chatbot (`chatbot_customers`/`chatbot_conversations`, added 2026-07), gci-price-monitor (`price_monitor_snapshots`, added 2026-07) | Service role key, held server-side only per repo | Reused deliberately across all three rather than provisioning separate paid projects. RLS enabled on every table, no permissive policies for anon/authenticated — service_role-only access pattern, consistent across all tenants of this project. If you add a new table here for a new use case, follow the same pattern. |
+| **CJ Dropshipping** | none — removed 2026-07 | — | **Was dead code (`NUPROZ-` SKU path in gci-order-hub), now fully removed** (gci-order-hub#45). nuprozone.com was discontinued due to brand conflicts; confirmed permanent, not paused. |
 
 ---
 
@@ -80,8 +82,17 @@ don't touch without separately confirming scope.
   this **did not create real Shopify orders or collect payment at all** — it
   simulated success locally. Fixed 2026-07-01 (PRs gci-brain#125, #126,
   gci-order-hub#42) to use Shopify's real Cart API + a post-payment webhook
-  for installer dispatch. If you're reading an old summary/memory of this
-  system that predates 2026-07-01, distrust its description of checkout.
+  for installer dispatch. A second, separate bug surfaced immediately after
+  via a real manual test: the redirect to real checkout used
+  `window.location.href`, which only navigates the iframe AI Match actually
+  runs inside on the real storefront (`templates/page.gci-ai-match-landing.liquid`
+  on the Dawn theme) — Shopify's checkout refuses to load inside any iframe
+  whose top-level page isn't a Shopify domain, so it silently failed. Fixed
+  2026-07-02 (gci-brain#128, `window.top!.location.href`), verified working
+  via a real completed checkout page (screenshot). If you're reading an old
+  summary/memory of this system, distrust anything about checkout that
+  predates 2026-07-02, not just 2026-07-01.
+
 - **TIRE- SKU prefix**: legacy. Most live Shopify products use native/mixed
   SKU formats now, not the `TIRE-` prefix. Filter by `status:ACTIVE AND
   productType:Tire`, not by SKU prefix, when querying the live catalog (see
@@ -106,29 +117,52 @@ with a code change:
    and dormant, ready to activate once CT delivers their side — see
    `api/lib/ct-client.ts` for exactly what's needed.
 
-## 6. Known issues open as of 2026-07-01 (code, tracked)
+## 6. Known issues (code) — status as of 2026-07-02
 
-1. **`gci-brain`'s `/api/airtable` proxy has no auth + open CORS** — exposes
-   installer PII. Fix planned, not yet done as of this writing.
-2. **`gcitires-chatbot`'s `/api/memory` times out regularly** — Airtable is
-   too slow for real-time chat lookups at the current 15s limit. Recommended
-   fix: migrate to Supabase/Postgres (already used elsewhere in this system,
-   e.g. gci-walmart-sync) instead of Airtable for this specific path.
-2. **`gci-price-monitor`'s SQLite persistence** — wiped every run, so there's
-   no real historical price trend data despite the job "succeeding" daily.
-   Needs a real persistent store before a redesign of the reporting is
-   worthwhile.
-3. **Deprecated Claude model references** — were hardcoded in 3 files in
+**Fixed and merged:**
+1. **`gci-brain`'s `/api/airtable` proxy** — was unauthenticated + open CORS, exposing installer PII (bank info) to any customer's browser during normal AI Match use. Fixed (gci-brain#129, gci-order-hub#44, both merged) — see §3 credential map.
+2. **`gcitires-chatbot`'s `/api/memory` timeouts** — migrated Airtable → Supabase. Code merged in gcitires-chatbot#27 (PR, not yet confirmed fully live — needs `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` env vars set on that Vercel project, and the historical-data migration script run — see below).
+3. **`gci-price-monitor`'s SQLite persistence** — migrated to Supabase, verified working end-to-end via a real `workflow_dispatch` test run (real scrape + real DB write, confirmed via direct SQL query) before merge. PR: gci-price-monitor#4.
+4. **Deprecated Claude model references** — were hardcoded in 3 files in
    `gci-brain` (`blog-publisher.ts`, `social-scheduler.ts`,
    `generateSeoDescriptions.ts`), causing silent failures for ~1 week+.
    Fixed as part of the audit — if you see `claude-sonnet-4-20250514`
    anywhere else in this system, it's stale and needs updating (check what
    model string is currently valid before hardcoding a new one — don't just
    copy whatever was here).
-4. **27 Walmart listings still carry a stale `TIRE-` SKU prefix** in Seller
+5. **27 Walmart listings still carry a stale `TIRE-` SKU prefix** in Seller
    Center, causing silent no-ops on price sync for those specific listings.
-   Documented fix: rename them in Walmart Seller Center (no code change
-   needed) — see gci-command-center's CONTEXT.md §8.
+   Confirmed 2026-07: **zero currently-ACTIVE Shopify products have a
+   `TIRE-` SKU anymore** (all archived/draft) — these are orphaned
+   Walmart-side listings referencing SKUs that no longer exist in the live
+   catalog at all. Can't be enumerated from Shopify data; needs a direct
+   Walmart Seller Center lookup (no Walmart connector was available to
+   pull this automatically). Fix: rename/relist in Seller Center, no code
+   change needed.
+6. **Installer application form was silently dropping submissions
+   entirely** — `submitInstallerApplication()` posted to a table
+   ('Installer Applications') that doesn't exist in the Airtable base and
+   wasn't in the old proxy's allowlist. Every real application failed
+   outright since the form was built. Fixed as part of gci-brain#129 —
+   now writes to the real `Installers` table (`Status: Pending Review`),
+   confirmed against the live schema.
+7. **`gci-order-hub`'s dead NUPROZ- (nuprozone.com) routing code** —
+   removed (gci-order-hub#45). Confirmed permanently discontinued.
+
+**Still open:**
+8. **Duplicate `gci-command-center` Vercel project** — identified as safe
+   to delete (§4), not yet deleted. No delete-project tool was available
+   to do this automatically; needs a manual delete in the Vercel
+   dashboard (Settings → Delete Project on the plain `.vercel.app` one,
+   NOT `-ofzf`).
+9. **Chatbot Supabase migration needs two manual steps before it's fully
+   live**: (a) set `SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY` in
+   gcitires-chatbot's Vercel project env vars, (b) run
+   `scripts/migrate-airtable-to-supabase.ts` once with real
+   `AIRTABLE_API_KEY` + Supabase credentials to bring over ~19,272
+   existing customer records — the new tables start empty otherwise (new
+   conversations still work fine either way, this only affects returning-
+   customer memory for pre-migration customers).
 
 ---
 
